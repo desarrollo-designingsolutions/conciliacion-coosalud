@@ -1,0 +1,2 @@
+Consecutivo,Id,Factura_id,Origin,Nit,Razón_social,Numero_factura,Fila,Columna,Valor,Error,Validación
+1,,,,,,,1,HEADERS,ID|FACTURA_ID|SERVICIO_ID|NIT|RAZON_SOCIAL|NUMERO_FACTURA|CODIGOS_GLOSA|VALOR_GLOSA|CONCILIATION_ID|ACCEPTED_VALUE_EPS|ACCEPTED_VALUE_IPS|EPS_RATIFIED_VALUE,Encabezados inválidos o fuera de orden. Deben coincidir exactamente con la especificación.,22-09-2025 20:33

@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# CSV -> Validaciones -> (opcional) MySQL insert masivo -> Reportes de errores / éxito
+#
+# Uso:
+#   python csv_conciliation_loader.py --csv "/ruta/al/archivo.csv" --out-dir "/ruta/de/salida" [--verbose]
+#
+# Variables de entorno (para fase MySQL):
+#   MYSQL_HOST, MYSQL_PORT (3306), MYSQL_DB, MYSQL_USER, MYSQL_PASSWORD
+
+import argparse
+import csv
+import os
+import sys
+import logging
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import uuid
+
+import pandas as pd
+
+try:
+    import pymysql
+except Exception:
+    pymysql = None  # modo "solo validaciones" si no está instalado
+
+# ------------------------ Config básica ------------------------
+
+EXPECTED_HEADERS = [
+    "ID",
+    "FACTURA_ID",
+    "SERVICIO_ID",
+    "ORIGIN",
+    "NIT",
+    "RAZON_SOCIAL",
+    "NUMERO_FACTURA",
+    "FECHA_INICIO",
+    "FECHA_FIN",
+    "MODALIDAD",
+    "REGIMEN",
+    "COBERTURA",
+    "CONTRATO",
+    "TIPO_DOCUMENTO",
+    "NUMERO_DOCUMENTO",
+    "PRIMER_NOMBRE",
+    "SEGUNDO_NOMBRE",
+    "PRIMER_APELLIDO",
+    "SEGUNDO_APELLIDO",
+    "GENERO",
+    "CODIGO_SERVICIO",
+    "DESCRIPCION_SERVICIO",
+    "CANTIDAD_SERVICIO",
+    "VALOR_UNITARIO_SERVICIO",
+    "VALOR_TOTAL_SERVICIO",
+    "CODIGOS_GLOSA",
+    "OBSERVACIONES_GLOSAS",
+    "VALOR_GLOSA",
+    "VALOR_APROBADO",
+    "ESTADO_RESPUESTA",
+    "NUMERO_DE_AUTORIZACION",
+    "RESPUESTA_DE_IPS",
+    "VALOR_ACEPTADO_POR_IPS",
+    "VALOR_ACEPTADO_POR_EPS",
+    "VALOR_RATIFICADO_EPS",
+    "OBSERVACIONES",
+]
+
+TZ = ZoneInfo("America/Bogota")
+
+# códigos de salida
+EXIT_OK = 0
+EXIT_CSV_ERRORS = 1
+EXIT_CSV_READ_ERROR = 2
+EXIT_MYSQL_ERROR = 3
+
+# ------------------------ Logging helpers ------------------------
+
+def setup_logger(verbose: bool, log_file: str | None):
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        except Exception:
+            pass
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
+
+def info(msg: str): logging.info(msg)
+def debug(msg: str): logging.debug(msg)
+def error(msg: str): logging.error(msg)
+
+# ------------------------ Modelos ------------------------
+
+@dataclass
+class ErrorRow:
+    consecutivo: int
+    id_: str
+    factura_id: str
+    origin: str
+    nit: str
+    razon_social: str
+    numero_factura: str
+    fila: int
+    columna: str
+    valor: str
+    error: str
+    validacion: str
+
+# ------------------------ Utilidades ------------------------
+
+def now_bogota_str() -> str:
+    dt = datetime.now(TZ)
+    # dia-mes-año hora:segundos
+    return dt.strftime("%d-%m-%Y %H:%S")
+
+def is_uuid_hyphenated(s: str) -> bool:
+    """
+    Valida que s sea un UUID canónico con guiones (36 chars):
+    xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    """
+    if s is None:
+        return False
+    s = str(s).strip()
+    try:
+        u = uuid.UUID(s)
+        return str(u) == s.lower()
+    except Exception:
+        return False
+
+def parse_decimal_maybe_comma(x: str) -> Decimal:
+    """
+    Convierte '1.234,56' | '1234,56' | '1234.56' a Decimal.
+    Si contiene ',' se asume coma como decimal (se quitan puntos de miles).
+    """
+    if x is None:
+        raise InvalidOperation("valor nulo")
+    s = str(x).strip()
+    if s == "":
+        raise InvalidOperation("vacío")
+    s = s.replace(" ", "").replace("$", "")
+    if "," in s:
+        s2 = s.replace(".", "")
+        s2 = s2.replace(",", ".")
+        return Decimal(s2)
+    else:
+        return Decimal(s)
+
+def write_errors_csv(errors: list[ErrorRow], out_path: str) -> None:
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "Consecutivo","Id","Factura_id","Origin","Nit","Razón_social",
+            "Numero_factura","Fila","Columna","Valor","Error","Validación"
+        ])
+        for e in errors:
+            w.writerow([
+                e.consecutivo, e.id_, e.factura_id, e.origin, e.nit, e.razon_social,
+                e.numero_factura, e.fila, e.columna, e.valor, e.error, e.validacion
+            ])
+
+def get_mysql_conn_from_env():
+    host = os.getenv("MYSQL_HOST")
+    port = int(os.getenv("MYSQL_PORT", "3306"))
+    db = os.getenv("MYSQL_DB")
+    user = os.getenv("MYSQL_USER")
+    pw = os.getenv("MYSQL_PASSWORD")
+    if not all([host, db, user, pw]):
+        return None, "Variables de entorno MySQL incompletas (MYSQL_HOST, MYSQL_DB, MYSQL_USER, MYSQL_PASSWORD)"
+    if pymysql is None:
+        return None, "pymysql no instalado. Instala con: pip install pymysql"
+    try:
+        info(f"Conectando a MySQL en {host}:{port}/{db} …")
+        conn = pymysql.connect(host=host, port=port, user=user, password=pw,
+                               database=db, autocommit=False, charset="utf8mb4")
+        info("Conexión MySQL OK.")
+        # Forzar colación de la sesión para evitar "Illegal mix of collations"
+        with conn.cursor() as cur:
+            cur.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
+            cur.execute("SET collation_connection = 'utf8mb4_unicode_ci'")
+        conn.commit()
+        return conn, None
+    except Exception as ex:
+        return None, f"No fue posible conectar a MySQL: {ex}"
+
+# ------------------------ Validaciones CSV ------------------------
+
+def validate_csv(df: pd.DataFrame, headers_in_file: list[str]) -> list[ErrorRow]:
+    errors: list[ErrorRow] = []
+    consecutivo = 1
+
+    # 1) Encabezados exactos y en el mismo orden
+    if headers_in_file != EXPECTED_HEADERS:
+        now_s = now_bogota_str()
+        errors.append(ErrorRow(
+            consecutivo, "", "", "", "", "", "",
+            1, "HEADERS", "|".join(headers_in_file),
+            "Encabezados inválidos o fuera de orden. Deben coincidir exactamente con la especificación.",
+            now_s
+        ))
+        return errors  # no seguimos si headers están mal
+
+    # 2) ID no vacío, UUID con guiones canónico y sin duplicados
+    seen_ids = set()
+    for idx, row in df.iterrows():
+        fila_excel = idx + 2  # encabezado en fila 1
+        now_s = now_bogota_str()
+        id_val = str(row.get("ID", "")).strip()
+        if id_val == "":
+            errors.append(ErrorRow(consecutivo, id_val, str(row.get("FACTURA_ID","")), str(row.get("ORIGIN","")),
+                                   str(row.get("NIT","")), str(row.get("RAZON_SOCIAL","")), str(row.get("NUMERO_FACTURA","")),
+                                   fila_excel, "ID", id_val, "ID vacío.", now_s)); consecutivo += 1
+        elif not is_uuid_hyphenated(id_val):
+            errors.append(ErrorRow(consecutivo, id_val, str(row.get("FACTURA_ID","")), str(row.get("ORIGIN","")),
+                                   str(row.get("NIT","")), str(row.get("RAZON_SOCIAL","")), str(row.get("NUMERO_FACTURA","")),
+                                   fila_excel, "ID", id_val,
+                                   "ID debe ser UUID válido con guiones (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).", now_s)); consecutivo += 1
+        elif id_val in seen_ids:
+            errors.append(ErrorRow(consecutivo, id_val, str(row.get("FACTURA_ID","")), str(row.get("ORIGIN","")),
+                                   str(row.get("NIT","")), str(row.get("RAZON_SOCIAL","")), str(row.get("NUMERO_FACTURA","")),
+                                   fila_excel, "ID", id_val, "ID duplicado en el CSV.", now_s)); consecutivo += 1
+        else:
+            seen_ids.add(id_val)
+
+    # 3) FACTURA_ID no vacío
+    for idx, row in df.iterrows():
+        fila_excel = idx + 2
+        now_s = now_bogota_str()
+        factura_id = str(row.get("FACTURA_ID", "")).strip()
+        if factura_id == "":
+            errors.append(ErrorRow(consecutivo, str(row.get("ID","")), factura_id, str(row.get("ORIGIN","")),
+                                   str(row.get("NIT","")), str(row.get("RAZON_SOCIAL","")), str(row.get("NUMERO_FACTURA","")),
+                                   fila_excel, "FACTURA_ID", factura_id, "FACTURA_ID vacío.", now_s)); consecutivo += 1
+
+    # 4) Numéricos y suma (IPS + EPS + RATIFICADO == VALOR_GLOSA)
+    for idx, row in df.iterrows():
+        fila_excel = idx + 2
+        now_s = now_bogota_str()
+
+        def report(col, val, msg):
+            nonlocal consecutivo
+            errors.append(ErrorRow(consecutivo, str(row.get("ID","")), str(row.get("FACTURA_ID","")), str(row.get("ORIGIN","")),
+                                   str(row.get("NIT","")), str(row.get("RAZON_SOCIAL","")), str(row.get("NUMERO_FACTURA","")),
+                                   fila_excel, col, str(val), msg, now_s))
+            consecutivo += 1
+
+        cols_req = ["VALOR_ACEPTADO_POR_IPS", "VALOR_ACEPTADO_POR_EPS", "VALOR_RATIFICADO_EPS", "VALOR_GLOSA"]
+        parsed: dict[str, Decimal | None] = {}
+        for col in cols_req:
+            val = row.get(col, "")
+            try:
+                parsed[col] = parse_decimal_maybe_comma(str(val))
+            except InvalidOperation:
+                report(col, val, f"{col} debe ser numérico (permite decimales con coma).")
+                parsed[col] = None
+
+        if all(parsed.get(c) is not None for c in cols_req):
+            suma = parsed["VALOR_ACEPTADO_POR_IPS"] + parsed["VALOR_ACEPTADO_POR_EPS"] + parsed["VALOR_RATIFICADO_EPS"]
+            if suma != parsed["VALOR_GLOSA"]:
+                report("VALOR_GLOSA", row.get("VALOR_GLOSA",""),
+                       "La suma de (IPS + EPS + RATIFICADO) debe ser igual a VALOR_GLOSA.")
+
+    # 5) OBSERVACIONES no vacío
+    for idx, row in df.iterrows():
+        fila_excel = idx + 2
+        now_s = now_bogota_str()
+        obs = str(row.get("OBSERVACIONES", "")).strip()
+        if obs == "":
+            errors.append(ErrorRow(consecutivo, str(row.get("ID","")), str(row.get("FACTURA_ID","")), str(row.get("ORIGIN","")),
+                                   str(row.get("NIT","")), str(row.get("RAZON_SOCIAL","")), str(row.get("NUMERO_FACTURA","")),
+                                   fila_excel, "OBSERVACIONES", obs, "OBSERVACIONES debe estar diligenciado.", now_s)); consecutivo += 1
+
+    return errors
+
+# ------------------------ Errores SQL → CSV ------------------------
+
+def _sql_error_rows_for_ids(df: pd.DataFrame, ids: list[str], msg: str) -> list[ErrorRow]:
+    """
+    Construye ErrorRow por cada ID afectado por un error SQL (conciliado previo o excepción).
+    Usa la posición real de la fila para calcular 'Fila' (encabezado = 1).
+    """
+    errors: list[ErrorRow] = []
+    consecutivo = 1
+    now_s = now_bogota_str()
+
+    for id_ in ids:
+        subset = df.loc[df["ID"] == id_]
+        if subset.empty:
+            errors.append(ErrorRow(
+                consecutivo, id_, "", "", "", "", "",
+                0, "SQL", id_, msg, now_s
+            ))
+            consecutivo += 1
+            continue
+
+        pos = int(subset.index[0])
+        fila_excel = pos + 2  # encabezado es fila 1
+        row = subset.iloc[0]
+
+        errors.append(ErrorRow(
+            consecutivo,
+            id_,
+            str(row.get("FACTURA_ID", "")),
+            str(row.get("ORIGIN", "")),
+            str(row.get("NIT", "")),
+            str(row.get("RAZON_SOCIAL", "")),
+            str(row.get("NUMERO_FACTURA", "")),
+            fila_excel,
+            "SQL",
+            id_,
+            msg,
+            now_s
+        ))
+        consecutivo += 1
+
+    return errors
+
+# ------------------------ Fase MySQL (masiva y rápida) ------------------------
+
+def mysql_phase_and_success_report(df: pd.DataFrame, out_dir: str, ids: list[str]) -> tuple[bool, str, str]:
+    """
+    Inserta masivamente en conciliation_results usando tabla temporal y un único INSERT ... SELECT.
+    Luego genera el CSV del JOIN de éxito. En caso de error, loguea por-ID en log_errores.csv.
+    Retorna (ok, mensaje, path_del_csv_exito).
+    """
+    conn, err = get_mysql_conn_from_env()
+    if conn is None:
+        errors = _sql_error_rows_for_ids(df, ids, f"Fase MySQL omitida: {err}")
+        out_err = os.path.join(out_dir, "log_errores.csv")
+        write_errors_csv(errors, out_err)
+        return False, f"Fase MySQL omitida: {err}", ""
+
+    try:
+        with conn.cursor() as cur:
+            # 0) Filtrar IDs ya conciliados para no intentarlos de nuevo
+            debug("Verificando conciliaciones existentes en lotes…")
+            existing = set()
+            chunk_size = 1000
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i+chunk_size]
+                placeholders = ",".join(["%s"] * len(chunk))
+                cur.execute(
+                    f"SELECT auditory_final_report_id FROM conciliation_results WHERE auditory_final_report_id IN ({placeholders})",
+                    chunk
+                )
+                existing.update(row[0] for row in cur.fetchall())
+
+            already_conciliated = sorted(list(existing))
+            ids_to_process = [i for i in ids if i not in existing]
+
+            if already_conciliated:
+                info(f"IDs ya conciliados detectados: {len(already_conciliated)}")
+                # Registrar errores por cada uno
+                msg = "Ese servicio ya se encuentra conciliado."
+                errors = _sql_error_rows_for_ids(df, already_conciliated, msg)
+                out_err = os.path.join(out_dir, "log_errores.csv")
+                write_errors_csv(errors, out_err)
+                if not ids_to_process:
+                    info("Todos los servicios del CSV ya estaban conciliados; generando reporte base…")
+                    return _generate_success_join(conn, out_dir, ids)
+
+            # 1) Preparar los registros a insertar desde el DataFrame (solo IDs a procesar)
+            info(f"Preparando datos para inserción masiva (pendientes: {len(ids_to_process)})…")
+
+            tmp_rows = []
+            df_sub = df[df["ID"].isin(ids_to_process)].copy()
+
+            for _idx, row in df_sub.iterrows():
+                afr_id = str(row["ID"]).strip()
+                resp_status = (str(row.get("ESTADO_RESPUESTA","")).strip() or None)
+                autorization = (str(row.get("NUMERO_DE_AUTORIZACION","")).strip() or None)
+                # Normalizar decimales
+                try:
+                    ips = parse_decimal_maybe_comma(row.get("VALOR_ACEPTADO_POR_IPS",""))
+                    eps = parse_decimal_maybe_comma(row.get("VALOR_ACEPTADO_POR_EPS",""))
+                    rat = parse_decimal_maybe_comma(row.get("VALOR_RATIFICADO_EPS",""))
+                except InvalidOperation:
+                    # Si algo raro pasó (no debería), saltar ese registro
+                    continue
+                ips_str = format(ips, 'f')
+                eps_str = format(eps, 'f')
+                rat_str = format(rat, 'f')
+                observation = (str(row.get("OBSERVACIONES","")).strip() or None)
+
+                tmp_rows.append((afr_id, resp_status, autorization, ips_str, eps_str, rat_str, observation))
+
+            if not tmp_rows:
+                return False, "No hay filas válidas para insertar (tras filtrar y normalizar).", ""
+
+            # 2) Crear tabla temporal y cargar por lotes con colación fija
+            cur.execute("""
+                CREATE TEMPORARY TABLE IF NOT EXISTS tmp_conciliation_in (
+                  afr_id CHAR(36) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                  response_status VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL,
+                  autorization_number VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL,
+                  accepted_value_ips DECIMAL(18,2) NOT NULL,
+                  accepted_value_eps DECIMAL(18,2) NOT NULL,
+                  eps_ratified_value DECIMAL(18,2) NOT NULL,
+                  observation TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL,
+                  PRIMARY KEY (afr_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            cur.execute("TRUNCATE TABLE tmp_conciliation_in")
+
+            info("Cargando datos en tabla temporal…")
+            insert_tmp_sql = """
+                INSERT INTO tmp_conciliation_in
+                (afr_id, response_status, autorization_number, accepted_value_ips, accepted_value_eps, eps_ratified_value, observation)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+            batch_size = 5000
+            total = len(tmp_rows)
+            for i in range(0, total, batch_size):
+                chunk = tmp_rows[i:i+batch_size]
+                cur.executemany(insert_tmp_sql, chunk)
+                info(f"Cargadas {min(i+batch_size, total)}/{total} filas en tmp_conciliation_in…")
+            conn.commit()
+            debug("Commit de carga temporal completado.")
+
+            # 3) ÚNICO INSERT … SELECT (rápido) con colaciones alineadas
+            info("Ejecutando inserción masiva en conciliation_results…")
+            insert_bulk_sql = """
+INSERT INTO conciliation_results
+(
+  id,
+  auditory_final_report_id,
+  invoice_audit_id,
+  reconciliation_group_id,
+  response_status,
+  autorization_number,
+  accepted_value_ips,
+  accepted_value_eps,
+  eps_ratified_value,
+  created_at,
+  updated_at,
+  observation
+)
+SELECT
+  UUID() AS id,
+  afr.id AS auditory_final_report_id,
+  afr.factura_id AS invoice_audit_id,
+  (
+    SELECT rg2.id
+    FROM reconciliation_groups rg2
+    WHERE rg2.third_id COLLATE utf8mb4_unicode_ci = afr.nit COLLATE utf8mb4_unicode_ci
+    ORDER BY rg2.created_at DESC
+    LIMIT 1
+  ) AS reconciliation_group_id,
+  tmp.response_status,
+  tmp.autorization_number,
+  tmp.accepted_value_ips,
+  tmp.accepted_value_eps,
+  tmp.eps_ratified_value,
+  NOW() AS created_at,
+  NOW() AS updated_at,
+  tmp.observation
+FROM tmp_conciliation_in tmp
+INNER JOIN auditory_final_reports afr
+  ON afr.id COLLATE utf8mb4_unicode_ci = tmp.afr_id COLLATE utf8mb4_unicode_ci
+INNER JOIN invoice_audits ia
+  ON ia.id COLLATE utf8mb4_unicode_ci = afr.factura_id COLLATE utf8mb4_unicode_ci
+LEFT JOIN conciliation_results cr
+  ON cr.auditory_final_report_id COLLATE utf8mb4_unicode_ci = afr.id COLLATE utf8mb4_unicode_ci
+WHERE cr.id IS NULL
+"""
+            cur.execute(insert_bulk_sql)
+            inserted = cur.rowcount  # filas insertadas
+            info(f"Inserción masiva completada. Registros insertados: {inserted}")
+            conn.commit()
+
+            # 4) Generar CSV de éxito (JOIN filtrado por IDs del CSV)
+            return _generate_success_join(conn, out_dir, ids)
+
+    except Exception as ex:
+        # Registrar el error SQL por cada ID que intentábamos procesar
+        err_msg = f"Error durante fase MySQL: {ex}"
+        errors = _sql_error_rows_for_ids(df, ids, err_msg)
+        out_err = os.path.join(out_dir, "log_errores.csv")
+        write_errors_csv(errors, out_err)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, err_msg, ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# ------------------------ Reporte de éxito ------------------------
+
+def _generate_success_join(conn, out_dir: str, ids: list[str]) -> tuple[bool, str, str]:
+    """
+    Genera CSV con JOIN de conciliation_results + auditory_final_reports + invoice_audits,
+    filtrado por los IDs del CSV. Usa columnas reales de auditory_final_reports.
+    """
+    try:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(ids))
+            join_sql = f"""
+SELECT
+  afr.id AS ID,
+  afr.factura_id AS FACTURA_ID,
+  afr.servicio_id AS SERVICIO_ID,
+  afr.nit AS NIT,
+  afr.razon_social AS RAZON_SOCIAL,
+  afr.numero_factura AS NUMERO_FACTURA,
+  afr.codigos_glosa AS CODIGOS_GLOSA,
+  afr.valor_glosa AS VALOR_GLOSA,
+  cs.id AS CONCILIATION_ID,
+  cs.accepted_value_eps AS ACCEPTED_VALUE_EPS,
+  cs.accepted_value_ips AS ACCEPTED_VALUE_IPS,
+  cs.eps_ratified_value AS EPS_RATIFIED_VALUE
+FROM conciliation_results cs
+INNER JOIN auditory_final_reports afr
+  ON afr.id = cs.auditory_final_report_id
+INNER JOIN invoice_audits ia
+  ON ia.id = afr.factura_id
+WHERE afr.id IN ({placeholders})
+ORDER BY afr.id
+"""
+            cur.execute(join_sql, ids)
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+
+        success_path = os.path.join(out_dir, "carga_exitosa_join.csv")
+        with open(success_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            w.writerows(rows)
+
+        return True, f"Proceso finalizado. Registros en reporte: {len(rows)}.", success_path
+    except Exception as ex:
+        return False, f"Error generando reporte de éxito: {ex}", ""
+# ------------------------ main ------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="Ruta del CSV de entrada")
+    ap.add_argument("--out-dir", required=True, help="Directorio de salida para reportes")
+    ap.add_argument("--verbose", action="store_true", help="Muestra logs detallados en consola")
+    ap.add_argument("--log-file", default="/data/out/runtime.log",
+                    help="Ruta del log (por defecto /data/out/runtime.log si existe /data/out)")
+    args = ap.parse_args()
+
+    # preparar salida y log
+    try:
+        os.makedirs(args.out_dir, exist_ok=True)
+    except Exception:
+        pass
+    log_file = args.log_file if os.path.isdir(os.path.dirname(args.log_file)) else None
+    setup_logger(args.verbose, log_file)
+
+    info("=== Inicio del proceso ===")
+    info(f"CSV: {args.csv}")
+    info(f"Salida: {args.out_dir}")
+    if log_file:
+        info(f"Log a archivo: {log_file}")
+
+    # ==== Lectura robusta del CSV: auto-separador + BOM-safe ====
+    try:
+        debug("Intentando leer CSV con auto-detección (utf-8-sig, sep=None, engine=python)…")
+        df = pd.read_csv(
+            args.csv,
+            dtype=str,
+            keep_default_na=False,
+            na_values=[],
+            encoding="utf-8-sig",   # quita BOM si existe
+            sep=None,               # auto-sniff del separador
+            engine="python",
+        )
+    except Exception as e1:
+        debug(f"Sniffer/utf-8-sig falló: {e1}. Intentando latin-1 y ';'…")
+        try:
+            df = pd.read_csv(
+                args.csv,
+                dtype=str,
+                keep_default_na=False,
+                na_values=[],
+                encoding="latin-1",
+                sep=";",
+                engine="python",
+            )
+        except Exception as e2:
+            error(f"No se pudo leer el CSV: {e2}")
+            info("=== Fin del proceso con error de lectura CSV ===")
+            sys.exit(EXIT_CSV_READ_ERROR)
+
+    # Normalizar encabezados (remover espacios y BOM residual)
+    headers_in_file = [ (h or "").strip().lstrip("\ufeff") for h in list(df.columns) ]
+    df.columns = headers_in_file
+    debug(f"Encabezados detectados (normalizados): {headers_in_file}")
+
+    # Validaciones
+    info("Validando estructura y reglas (CSV)…")
+    errors = validate_csv(df, headers_in_file)
+
+    if errors:
+        out_err = os.path.join(args.out_dir, "log_errores.csv")
+        write_errors_csv(errors, out_err)
+        error(f"Se encontraron {len(errors)} errores. Ver: {out_err}")
+        info("=== Fin del proceso con errores de CSV ===")
+        sys.exit(EXIT_CSV_ERRORS)
+
+    info("Validaciones CSV OK ✅")
+
+    # Fase MySQL masiva (si hay credenciales)
+    ids = df["ID"].tolist()
+    info(f"Validando contra MySQL e insertando masivamente (IDs a procesar: {len(ids)})…")
+    ok, msg, success_csv = mysql_phase_and_success_report(df, args.out_dir, ids)
+
+    if ok:
+        info(msg)
+        if success_csv:
+            info(f"Archivo de éxito generado: {success_csv}")
+        info("=== Fin del proceso OK ===")
+        sys.exit(EXIT_OK)
+    else:
+        error(f"Fallo en fase MySQL: {msg}")
+        info("=== Fin del proceso con errores de MySQL ===")
+        sys.exit(EXIT_MYSQL_ERROR)
+
+if __name__ == "__main__":
+    main()
