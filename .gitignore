@@ -1,0 +1,14 @@
+# Environment files
+.env
+!.env.example
+
+# Data directory (uploads, outputs, etc.)
+/data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+.history/
