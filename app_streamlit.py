@@ -795,6 +795,7 @@ def render_loader_page():
     st.session_state.setdefault("proc", None)
     st.session_state.setdefault("log_offset", 0)
     st.session_state.setdefault("last_result", "neutral")
+    st.session_state.setdefault("already_conciliated_detected", False)
 
     if start_btn:
         if uploaded is None:
@@ -808,6 +809,7 @@ def render_loader_page():
             st.session_state.running = True
             st.session_state.log_offset = 0
             st.session_state.last_result = "neutral"
+            st.session_state.already_conciliated_detected = False
 
     log_box = st.empty()
     status_box = st.empty()
@@ -819,18 +821,42 @@ def render_loader_page():
                 st.session_state.log_offset, new_text = tail_file(LOG_FILE, st.session_state.log_offset)
                 if new_text:
                     log_box.code(new_text, language="log")
+                    text_l = new_text.lower()
+                    if (
+                        "ids ya conciliados detectados" in text_l
+                        or "ya estaban conciliados" in text_l
+                        or "ya se encuentran conciliadas" in text_l
+                    ):
+                        st.session_state.already_conciliated_detected = True
                 else:
                     if st.session_state.proc.stdout:
                         line = st.session_state.proc.stdout.readline()
                         if line:
                             log_box.code(line, language="log")
+                            text_l = str(line).lower()
+                            if (
+                                "ids ya conciliados detectados" in text_l
+                                or "ya estaban conciliados" in text_l
+                                or "ya se encuentran conciliadas" in text_l
+                            ):
+                                st.session_state.already_conciliated_detected = True
                 time.sleep(0.3)
             else:
                 st.session_state.log_offset, new_text = tail_file(LOG_FILE, st.session_state.log_offset)
                 if new_text:
                     log_box.code(new_text, language="log")
+                    text_l = new_text.lower()
+                    if (
+                        "ids ya conciliados detectados" in text_l
+                        or "ya estaban conciliados" in text_l
+                        or "ya se encuentran conciliadas" in text_l
+                    ):
+                        st.session_state.already_conciliated_detected = True
                 exit_code = st.session_state.proc.returncode
-                if exit_code == 0:
+                if st.session_state.already_conciliated_detected:
+                    status_box.error("Las facturas cargadas ya se encuentran conciliadas en el sistema.")
+                    st.session_state.last_result = "error"
+                elif exit_code == 0:
                     status_box.success("Proceso finalizado OK ✅")
                     st.session_state.last_result = "success"
                 else:
@@ -953,7 +979,7 @@ def render_loader_page():
             "% IPS",
             min_value=0.0,
             max_value=100.0,
-            value=90.0,
+            value=0.0,
             step=0.1,
             key="pct_ips",
         )
@@ -961,7 +987,7 @@ def render_loader_page():
             "% EPS",
             min_value=0.0,
             max_value=100.0,
-            value=5.0,
+            value=0.0,
             step=0.1,
             key="pct_eps",
         )
@@ -969,17 +995,16 @@ def render_loader_page():
             "% RAT",
             min_value=0.0,
             max_value=100.0,
-            value=5.0,
+            value=0.0,
             step=0.1,
             key="pct_rat",
         )
 
-        st.button("Generar sábana", key="btn_gen_pct")
-        if st.session_state.get("btn_gen_pct") or st.button("Generar sábana", key="btn_gen_pct_fire"):
-            file_obj = st.session_state.get("pct_excel_upl")
-            ips = st.session_state.get("pct_ips", 0.0)
-            eps = st.session_state.get("pct_eps", 0.0)
-            rat = st.session_state.get("pct_rat", 0.0)
+        if st.button("Generar sábana", key="btn_gen_pct"):
+            file_obj = pct_file
+            ips = pct_ips
+            eps = pct_eps
+            rat = pct_rat
             if not file_obj:
                 st.error("Sube un Excel primero.")
             elif abs((ips + eps + rat) - 100.0) > 0.001:
