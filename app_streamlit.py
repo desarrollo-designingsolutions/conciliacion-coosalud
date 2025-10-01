@@ -483,11 +483,9 @@ def render_summary_page():
     df_view = filtered.copy()
     df_view["Acciones"] = False
 
-    st.session_state.pop("summary_table_editor", None)
-
     editor_result = st.data_editor(
         df_view,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         disabled=[col for col in df_view.columns if col != "Acciones"],
         column_config={
@@ -510,34 +508,21 @@ def render_summary_page():
     clicked_rows = editor_result[editor_result["Acciones"] == True]
     if not clicked_rows.empty:
         idx = clicked_rows.index[0]
-        row = filtered.loc[idx]
+        row = editor_result.loc[idx]
         st.session_state["selected_nit"] = str(row.get("nit", ""))
         st.session_state["selected_razon"] = str(row.get("razon_social", ""))
-        st.session_state.show_state_modal = True
+        st.session_state["menu_option"] = "Detalle NIT"
+        st.session_state["show_state_modal"] = False
         rerun_app()
 
     selected_nit = st.session_state.get("selected_nit")
     selected_razon = st.session_state.get("selected_razon")
 
     if st.session_state.get("show_state_modal") and selected_nit:
-        if hasattr(st, "modal"):
-            with st.modal("Agregar estado al NIT"):
-                try:
-                    cfg_modal, missing_modal = get_db_config()
-                except ValueError as exc:
-                    st.error(str(exc))
-                else:
-                    if missing_modal:
-                        st.error(
-                            "Faltan variables de entorno para la conexión MySQL: "
-                            + ", ".join(missing_modal)
-                        )
-                    else:
-                        render_state_form(cfg_modal, selected_nit, selected_razon, prefix="modal")
-        else:
-            st.session_state["menu_option"] = "Detalle NIT"
-            st.session_state.show_state_modal = False
-            rerun_app()
+        # Enviar siempre a la vista "Detalle NIT" para evitar problemas con modales.
+        st.session_state["menu_option"] = "Detalle NIT"
+        st.session_state.show_state_modal = False
+        rerun_app()
 
 
 def render_nit_detail_page():
@@ -747,7 +732,7 @@ def render_loader_page():
                         cols = [d[0] for d in cur.description]
                         import pandas as pd
                         df_act = pd.DataFrame(rows, columns=cols)
-                        st.dataframe(df_act, use_container_width=True)
+                        st.dataframe(df_act, width='stretch')
                         from pathlib import Path
                         for _, r in df_act.iterrows():
                             p = Path(str(r["file_path"]))
@@ -812,7 +797,7 @@ def render_loader_page():
                 try:
                     df_out, resumen, csv_bytes = generate_percentage_sheet(file_obj, ips, eps, rat)
                     st.success("Sábana generada.")
-                    st.dataframe(df_out.head(15), use_container_width=True)
+                    st.dataframe(df_out.head(15), width='stretch')
                     st.code(resumen)
                     st.download_button(
                         "Descargar sábana por %",
@@ -834,10 +819,7 @@ def main():
     default_menu = st.session_state.get("menu_option", "Cargar CSV")
     menu_options = ["Cargar CSV", "Resumen"]
 
-    show_detail_option = (
-        not hasattr(st, "modal")
-        and st.session_state.get("selected_nit")
-    )
+    show_detail_option = bool(st.session_state.get("selected_nit"))
     if show_detail_option:
         menu_options.append("Detalle NIT")
 
