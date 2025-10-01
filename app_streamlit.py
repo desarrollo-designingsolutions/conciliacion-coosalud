@@ -384,6 +384,8 @@ def generate_percentage_sheet(file_obj, pct_ips: float, pct_eps: float, pct_rat:
         rat=_to_dec(df2.at[i,"VALOR_RATIFICADO_EPS"])
         if ips==glosa and eps==0 and rat==0:
             txt="EL PRESTADOR ACEPTA EL VALOR"
+        elif eps==glosa and ips==0 and rat==0:
+            txt="EL PRESTADOR ADJUNTA LOS SOPORTES NECESARIOS PARA LA GLOSA APLICADA Y ADICIONAN EL CONTRATO Y ANEXOS DEL MISMO"
         elif ips==glosa:
             txt="SE LEVANTA GLOSA, EL PRESTADOR PRESENTA LOS SOPORTES NECESARIOS"
         elif ips>0 and eps>0:
@@ -395,7 +397,10 @@ def generate_percentage_sheet(file_obj, pct_ips: float, pct_eps: float, pct_rat:
         elif eps>0 and rat>0:
             txt="EPS ACEPTA GLOSA PARCIAL, SE RATIFICA GLOSA PARCIAL"
         else:
-            txt=str(df2.at[i,"OBSERVACIONES"] or "").strip()
+            raw_obs = df2.at[i, "OBSERVACIONES"]
+            txt = str(raw_obs or "").strip()
+            if txt.lower() == "nan":
+                txt = ""
         obs.append(txt)
     df2["OBSERVACIONES"]=obs
 
