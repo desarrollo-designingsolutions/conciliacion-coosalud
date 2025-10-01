@@ -547,7 +547,7 @@ def render_summary_page():
     selected_nits = st.multiselect(
         "Filtrar por NIT",
         options=unique_nits,
-        default=unique_nits,
+        default=[],
     )
 
     filtered = df[df["nit"].isin(selected_nits)] if selected_nits else df
