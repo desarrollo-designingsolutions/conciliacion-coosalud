@@ -232,6 +232,34 @@ def insert_nit_state(cfg: dict, nit: str, estado: str, comentario: str, user_ema
                 """,
                 (nit, estado, comentario, user_email),
             )
+            last_id = cur.lastrowid
+        conn.commit()
+        return last_id
+    finally:
+        conn.close()
+
+
+def insert_acta_pdf_record(cfg: dict, id_str: str, nit: str, razon_social: str, file_name: str, file_path: str, usuario: str, nit_state_id: int | None):
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        autocommit=False,
+        charset="utf8mb4",
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO conciliation_acta_files_pdf
+                    (id, nit, razon_social, file_name, file_path, usuario, nit_state_id, created_at, updated_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                """,
+                (id_str, nit, razon_social, file_name, file_path, usuario, nit_state_id),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -401,11 +429,17 @@ def render_state_form(cfg: dict, nit: str, razon: str | None, prefix: str) -> No
         STATE_OPTIONS,
         key=estado_key,
     )
+    estado_actual = st.session_state.get(estado_key)
     st.text_area(
         "Comentario (opcional)",
         key=comentario_key,
         height=150,
     )
+
+    # Si el estado seleccionado es "Acta Firmada", solicitar el PDF
+    pdf_key = f"{prefix}_acta_pdf"
+    if estado_actual == "Acta Firmada":
+        st.file_uploader("Cargar PDF del acta (obligatorio)", type=["pdf"], key=pdf_key)
 
     col_save, col_cancel = st.columns(2)
     with col_save:
@@ -416,16 +450,49 @@ def render_state_form(cfg: dict, nit: str, razon: str | None, prefix: str) -> No
             else:
                 comentario = st.session_state.get(comentario_key, "")
                 user_email = st.session_state.get("user_email", "")
-                try:
-                    insert_nit_state(cfg, nit, estado, comentario, user_email)
-                    load_summary_dataframe.clear()
-                    clear_state_form(prefix)
-                    clear_state_selection()
-                    st.success("Estado guardado correctamente.")
-                    st.session_state["menu_option"] = "Resumen"
-                    rerun_app()
-                except Exception as exc:
-                    st.error(f"No se pudo guardar el estado: {exc}")
+                # Validar PDF si el estado es "Acta Firmada"
+                need_pdf = (estado == "Acta Firmada")
+                pdf_file = st.session_state.get(pdf_key)
+                if need_pdf and not pdf_file:
+                    st.error("Debes cargar el PDF del acta para 'Acta Firmada'.")
+                else:
+                    try:
+                        nit_state_id = insert_nit_state(cfg, nit, estado, comentario, user_email)
+                        # Si aplica, guardar PDF a disco y registrar en BD
+                        if need_pdf and pdf_file is not None:
+                            from pathlib import Path
+                            import uuid
+                            pdf_dir = OUT_DIR / "actas_pdf"
+                            try:
+                                pdf_dir.mkdir(parents=True, exist_ok=True)
+                            except Exception:
+                                pass
+                            original_name = Path(getattr(pdf_file, "name", "acta.pdf")).name
+                            safe_nit = "".join(ch for ch in str(nit) if ch.isalnum()) or "sin_nit"
+                            ts = time.strftime("%Y%m%d_%H%M%S")
+                            file_name = f"acta_pdf_{safe_nit}_{ts}.pdf"
+                            file_path = str(pdf_dir / file_name)
+                            with open(file_path, "wb") as f:
+                                f.write(pdf_file.getbuffer())
+                            acta_pdf_id = str(uuid.uuid4())
+                            insert_acta_pdf_record(
+                                cfg,
+                                acta_pdf_id,
+                                nit,
+                                razon or "",
+                                original_name,
+                                file_path,
+                                user_email or "",
+                                nit_state_id,
+                            )
+                        load_summary_dataframe.clear()
+                        clear_state_form(prefix)
+                        clear_state_selection()
+                        st.success("Estado guardado correctamente.")
+                        st.session_state["menu_option"] = "Resumen"
+                        rerun_app()
+                    except Exception as exc:
+                        st.error(f"No se pudo guardar el estado: {exc}")
     with col_cancel:
         if st.button("Cancelar", key=cancel_key):
             clear_state_form(prefix)

@@ -584,9 +584,13 @@ def get_mysql_conn_from_env():
             cur.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
             cur.execute("SET collation_connection = 'utf8mb4_unicode_ci'")
         conn.commit()
+
         return conn, None
     except Exception as ex:
         return None, f"No fue posible conectar a MySQL: {ex}"
+
+
+        
 
 # ------------------------ Validaciones CSV ------------------------
 
