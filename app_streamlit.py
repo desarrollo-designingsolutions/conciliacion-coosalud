@@ -637,6 +637,13 @@ def render_summary_page():
     except Exception:
         link_cols = []
 
+    # Configurar etiquetas amigables para columnas base (reemplazar '_' por ' ')
+    pretty_labels = {
+        col: st.column_config.Column(col.replace("_", " "))
+        for col in df_view.columns
+        if col != "Acciones" and col not in link_cols
+    }
+
     editor_result = st.data_editor(
         df_view,
         width='stretch',
@@ -657,6 +664,7 @@ def render_summary_page():
                 )
                 for col in link_cols
             },
+            **pretty_labels,
         },
         key="summary_table_editor",
     )
@@ -888,7 +896,15 @@ def render_loader_page():
         )
 
     with st.expander("Descargar actas de conciliación", expanded=False):
-        nit_filter = st.text_input("Filtrar por NIT (opcional)")
+        nit_filter_raw = st.text_input(
+            "Filtrar por NIT (opcional)",
+            key="actas_nit_filter",
+            placeholder="Solo números",
+            help="Ingresa solo dígitos del NIT (sin guiones ni DV)",
+        )
+        nit_filter = "".join(ch for ch in (nit_filter_raw or "") if ch.isdigit())
+        if (nit_filter_raw or "") and nit_filter_raw != nit_filter:
+            st.warning("Solo números permitidos para NIT; se removieron caracteres no numéricos.")
         try:
             cfg, missing = get_db_config()
             if missing:
@@ -925,6 +941,12 @@ def render_loader_page():
                         cols = [d[0] for d in cur.description]
                         import pandas as pd
                         df_act = pd.DataFrame(rows, columns=cols)
+                        if df_act.empty:
+                            if nit_filter:
+                                st.info("No se encontraron actas para el NIT ingresado.")
+                            else:
+                                st.info("Aún no hay actas registradas para descargar.")
+                            return
                         # Construir columna de descarga dentro de la tabla usando data URLs
                         from pathlib import Path
                         import base64
@@ -945,12 +967,15 @@ def render_loader_page():
                             else:
                                 url = ""
                             download_urls.append(url)
-                        df_act["Descargar"] = download_urls
+                        # Forzar tipo texto para compatibilidad con LinkColumn
+                        df_act["Descargar"] = pd.Series(download_urls, dtype=object)
 
                         # Mostrar como editor solo-lectura con columna Link
                         # Evitar duplicar "Descargar" y ocultar "file_path"
                         visible_cols = [c for c in df_act.columns if c not in ("file_path", "Descargar")] + ["Descargar"]
                         df_view = df_act[[c for c in visible_cols if c in df_act.columns]]
+                        # Etiquetas amigables: reemplazar '_' por ' '
+                        pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns if c != "Descargar"}
                         st.data_editor(
                             df_view,
                             width='stretch',
@@ -960,7 +985,8 @@ def render_loader_page():
                                 "Descargar": st.column_config.LinkColumn(
                                     "Descargar",
                                     display_text="⬇️ Descargar",
-                                )
+                                ),
+                                **pretty_cols,
                             },
                         )
                 finally:

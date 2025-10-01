@@ -755,6 +755,7 @@ def mysql_phase_and_success_report(df: pd.DataFrame, out_dir: str, ids: list[str
                 existing.update(row[0] for row in cur.fetchall())
 
             already_conciliated = sorted(list(existing))
+            had_already_conciliated = bool(already_conciliated)
             ids_to_process = [i for i in ids if i not in existing]
 
             if already_conciliated:
@@ -765,8 +766,8 @@ def mysql_phase_and_success_report(df: pd.DataFrame, out_dir: str, ids: list[str
                 out_err = os.path.join(out_dir, "log_errores.csv")
                 write_errors_csv(errors, out_err)
                 if not ids_to_process:
-                    info("Todos los servicios del CSV ya estaban conciliados; generando reporte base…")
-                    return _finalize_success(conn, df, out_dir, ids)
+                    info("Todos los servicios del CSV ya estaban conciliados; no se generarán actas.")
+                    return False, "Las facturas cargadas ya se encuentran conciliadas en el sistema.", ""
 
             # 1) Preparar los registros a insertar desde el DataFrame (solo IDs a procesar)
             info(f"Preparando datos para inserción masiva (pendientes: {len(ids_to_process)})…")
@@ -907,7 +908,12 @@ ON DUPLICATE KEY UPDATE
             conn.commit()
 
             # 4) Generar CSV de éxito (JOIN filtrado por IDs del CSV)
-            return _finalize_success(conn, df, out_dir, ids)
+            # Si hubo IDs ya conciliados, omitir generación de actas.
+            if 'had_already_conciliated' in locals() and had_already_conciliated:
+                info("Se omite la generación de actas por detectar IDs ya conciliados en la carga.")
+                return _generate_success_join(conn, out_dir, ids)
+            else:
+                return _finalize_success(conn, df, out_dir, ids)
 
     except Exception as ex:
         # Registrar el error SQL por cada ID que intentábamos procesar
