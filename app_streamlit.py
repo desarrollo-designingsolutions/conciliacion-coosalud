@@ -550,6 +550,88 @@ def render_summary_page():
     df_view = filtered.copy()
     df_view["Acciones"] = False
 
+    # Agregar columnas de descargas por NIT (Excel/PDF)
+    link_cols: list[str] = []
+    try:
+        conn = pymysql.connect(
+            host=cfg["host"],
+            port=cfg["port"],
+            user=cfg["user"],
+            password=cfg["password"],
+            database=cfg["database"],
+            cursorclass=pymysql.cursors.Cursor,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT nit, file_name, file_path, created_at
+                    FROM conciliation_acta_files
+                    ORDER BY created_at DESC
+                    """
+                )
+                excel_rows = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT nit, file_name, file_path, created_at
+                    FROM conciliation_acta_files_pdf
+                    ORDER BY created_at DESC
+                    """
+                )
+                pdf_rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        excel_map: dict[str, list[str]] = {}
+        for nit_val, _fname, fpath, _created in excel_rows:
+            try:
+                p = Path(str(fpath))
+                if p.exists():
+                    with open(p, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                        # Incluir sugerencia de nombre para descarga
+                        safe_name = str(_fname or "acta.xlsx").replace(",", "_")
+                        url = (
+                            "data:application/"
+                            f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64,"
+                            + b64
+                        )
+                else:
+                    url = ""
+            except Exception:
+                url = ""
+            excel_map.setdefault(str(nit_val), []).append(url)
+
+        pdf_map: dict[str, list[str]] = {}
+        for nit_val, _fname, fpath, _created in pdf_rows:
+            try:
+                p = Path(str(fpath))
+                if p.exists():
+                    with open(p, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                        safe_name = str(_fname or "acta.pdf").replace(",", "_")
+                        # octet-stream para forzar descarga y sugerir nombre
+                        url = f"data:application/octet-stream;name={safe_name};base64,{b64}"
+                else:
+                    url = ""
+            except Exception:
+                url = ""
+            pdf_map.setdefault(str(nit_val), []).append(url)
+
+        max_excel = max((len(v) for v in excel_map.values()), default=0)
+        max_pdf = max((len(v) for v in pdf_map.values()), default=0)
+
+        for i in range(max_excel):
+            col_name = ("Actas excel" if i == 0 else f"Actas excel {i+1}")
+            link_cols.append(col_name)
+            df_view[col_name] = df_view["nit"].map(lambda n: (excel_map.get(str(n), []) + [""] * max_excel)[i])
+        for i in range(max_pdf):
+            col_name = ("Actas pdf" if i == 0 else f"Actas pdf {i+1}")
+            link_cols.append(col_name)
+            df_view[col_name] = df_view["nit"].map(lambda n: (pdf_map.get(str(n), []) + [""] * max_pdf)[i])
+    except Exception:
+        link_cols = []
+
     editor_result = st.data_editor(
         df_view,
         width='stretch',
@@ -560,7 +642,16 @@ def render_summary_page():
                 "➕",
                 help="Agregar estado al NIT",
                 default=False,
-            )
+            ),
+            **{
+                col: st.column_config.LinkColumn(
+                    col,
+                    display_text=(
+                        "Descargar Acta" if col.lower().startswith("actas excel") else "Acta firmada"
+                    ),
+                )
+                for col in link_cols
+            },
         },
         key="summary_table_editor",
     )
@@ -813,9 +904,10 @@ def render_loader_page():
                                 try:
                                     with open(p, "rb") as f:
                                         b64 = base64.b64encode(f.read()).decode()
+                                    safe_name = str(r.get("file_name") or "acta.xlsx").replace(",", "_")
                                     url = (
                                         "data:application/"
-                                        "vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + b64
+                                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64," + b64
                                     )
                                 except Exception:
                                     url = ""
