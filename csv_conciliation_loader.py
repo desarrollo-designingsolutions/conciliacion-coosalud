@@ -14,12 +14,16 @@ import os
 import sys
 import logging
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from pathlib import Path
+from copy import copy
 import uuid
 
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font
 
 try:
     import pymysql
@@ -68,6 +72,8 @@ EXPECTED_HEADERS = [
 ]
 
 TZ = ZoneInfo("America/Bogota")
+ACTA_TEMPLATE_NAME = "XXXXXXX_GUIA.xlsx"
+ACTA_OUTPUT_DIRNAME = "actas_conciliacion"
 
 # códigos de salida
 EXIT_OK = 0
@@ -162,6 +168,401 @@ def write_errors_csv(errors: list[ErrorRow], out_path: str) -> None:
                 e.consecutivo, e.id_, e.factura_id, e.origin, e.nit, e.razon_social,
                 e.numero_factura, e.fila, e.columna, e.valor, e.error, e.validacion
             ])
+
+
+def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -> list[dict]:
+    """Genera archivos de acta a partir de la plantilla y retorna metadatos de descarga."""
+    if not ids or df.empty:
+        return []
+
+    df_subset = df[df["ID"].isin(ids)].copy()
+    if df_subset.empty:
+        return []
+
+    template_path = Path(__file__).resolve().parent / ACTA_TEMPLATE_NAME
+    if not template_path.exists():
+        error(f"Plantilla de acta no encontrada: {template_path}")
+        return []
+
+    currency_format = '[$-es-CO]"$" #.##0'
+    fallback_currency_format = '[$-en-US]"$" #,##0'
+
+    acta_dir = Path(out_dir) / ACTA_OUTPUT_DIRNAME
+    try:
+        acta_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        error(f"No se pudo crear el directorio para actas ({acta_dir}): {exc}")
+        return []
+
+    generated_records: list[dict] = []
+    usuario_default = os.getenv("ACTA_GENERATION_USER") or os.getenv("APP_USER") or os.getenv("USER") or "system"
+
+    current_dt = datetime.now(TZ)
+    current_dt_naive = current_dt.replace(tzinfo=None)
+    month_names = {
+        1: "ENERO", 2: "FEBRERO", 3: "MARZO", 4: "ABRIL", 5: "MAYO", 6: "JUNIO",
+        7: "JULIO", 8: "AGOSTO", 9: "SEPTIEMBRE", 10: "OCTUBRE", 11: "NOVIEMBRE", 12: "DICIEMBRE",
+    }
+
+    df_subset["NIT"] = df_subset["NIT"].astype(str).str.strip()
+    df_subset["RAZON_SOCIAL"] = df_subset["RAZON_SOCIAL"].astype(str).str.strip()
+
+    format_error_reported = False
+    currency_cells: list = []
+
+    def apply_currency(cell):
+        nonlocal format_error_reported
+        currency_cells.append(cell)
+        if format_error_reported:
+            cell.number_format = fallback_currency_format
+            return
+        try:
+            cell.number_format = currency_format
+        except Exception as exc:
+            if not format_error_reported:
+                error(f"No se pudo aplicar formato monetario personalizado: {exc}")
+                format_error_reported = True
+            cell.number_format = fallback_currency_format
+
+    location_cache: dict[str, tuple[str, str]] = {}
+    column_cache: dict[str, set[str]] = {}
+
+    def get_db_name() -> str:
+        if conn is None:
+            return ""
+        db_name = getattr(conn, "db", "") or ""
+        if isinstance(db_name, bytes):
+            db_name = db_name.decode("utf-8", errors="ignore")
+        if not db_name:
+            db_name = os.getenv("MYSQL_DB", "")
+        return db_name
+
+    def get_table_columns(table: str) -> set[str]:
+        if conn is None:
+            return set()
+        table_key = table.lower()
+        if table_key in column_cache:
+            return column_cache[table_key]
+        db_name = get_db_name()
+        if not db_name:
+            column_cache[table_key] = set()
+            return set()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    """,
+                    (db_name, table),
+                )
+                cols = {row[0].lower() for row in cur.fetchall()}
+                column_cache[table_key] = cols
+                return cols
+        except Exception as exc:
+            error(f"No se pudieron obtener las columnas de {table}: {exc}")
+            column_cache[table_key] = set()
+            return set()
+
+    def fetch_location(nit: str) -> tuple[str, str]:
+        key = nit or ""
+        if key in location_cache:
+            return location_cache[key]
+        departamento = ""
+        municipio = ""
+        if conn is not None and key:
+            try:
+                with conn.cursor() as cur:
+                    row = None
+                    td_columns = get_table_columns("third_departments")
+                    if "nit" in td_columns:
+                        cur.execute(
+                            """
+                            SELECT departamento, municipio
+                            FROM third_departments
+                            WHERE nit = %s
+                            ORDER BY updated_at DESC, id DESC
+                            LIMIT 1
+                            """,
+                            (key,),
+                        )
+                        row = cur.fetchone()
+
+                    if row is None and "third_id" in td_columns:
+                        third_columns = get_table_columns("thirds")
+                        conditions: list[str] = []
+                        params: list[str] = []
+                        candidate_map = [
+                            ("nit", "t.nit = %s"),
+                            ("identification", "t.identification = %s"),
+                            ("numero_identificacion", "t.numero_identificacion = %s"),
+                            ("documento", "t.documento = %s"),
+                            ("document_number", "t.document_number = %s"),
+                        ]
+                        for col_name, expr in candidate_map:
+                            if col_name in third_columns:
+                                conditions.append(expr)
+                                params.append(key)
+
+                        if conditions:
+                            where_clause = " OR ".join(conditions)
+                            query = f"""
+SELECT td.departamento, td.municipio
+FROM third_departments td
+INNER JOIN thirds t ON t.id = td.third_id
+WHERE {where_clause}
+ORDER BY td.updated_at DESC, td.id DESC
+LIMIT 1
+"""
+                            cur.execute(query, tuple(params))
+                            row = cur.fetchone()
+
+                    if row:
+                        departamento = (row[0] or "").strip()
+                        municipio = (row[1] or "").strip()
+            except Exception as exc:
+                error(f"No se pudo obtener departamento/municipio para el NIT {key}: {exc}")
+        location_cache[key] = (departamento, municipio)
+        return location_cache[key]
+
+    def parse_decimal(value: str | Decimal | None) -> int:
+        if value in (None, ""):
+            return 0
+        try:
+            dec = parse_decimal_maybe_comma(value)
+            dec = dec.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+            return int(dec)
+        except Exception:
+            return 0
+
+    def parse_fecha(value: str | None):
+        if not value:
+            return None
+        text = str(value).strip()
+        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
+
+    unique_pairs = df_subset[["NIT", "RAZON_SOCIAL"]].drop_duplicates()
+
+    for _, pair in unique_pairs.iterrows():
+        nit = pair.get("NIT", "")
+        razon_social = pair.get("RAZON_SOCIAL", "")
+        pair_rows = df_subset[(df_subset["NIT"] == nit) & (df_subset["RAZON_SOCIAL"] == razon_social)].copy()
+        if pair_rows.empty:
+            continue
+
+        currency_cells.clear()
+        departamento, municipio = fetch_location(nit)
+        total_glosa = Decimal('0')
+        total_eps = Decimal('0')
+        total_ips = Decimal('0')
+        total_rat = Decimal('0')
+
+        wb = None
+        try:
+            wb = load_workbook(template_path)
+            ws = wb.active
+
+            for col_idx in range(1, 14):
+                header_cell = ws.cell(row=7, column=col_idx)
+                try:
+                    header_cell.font = header_cell.font.copy(name="Calibri", size=5)
+                except Exception:
+                    header_cell.font = Font(name="Calibri", size=5)
+
+            ws["F5"] = nit
+            ws["H4"] = razon_social
+            ws["J5"] = current_dt_naive
+            ws["J5"].number_format = "DD/MM/YYYY"
+            ws["B4"] = departamento
+            ws["B5"] = municipio
+
+            row_count = len(pair_rows)
+            if row_count == 0:
+                continue
+
+            additional_rows = max(row_count - 1, 0)
+            if additional_rows:
+                ws.insert_rows(9, amount=additional_rows)
+
+            template_cells = tuple(ws[8])
+            for offset in range(row_count):
+                target_row = 8 + offset
+                for src_cell in template_cells:
+                    dest_cell = ws.cell(row=target_row, column=src_cell.col_idx)
+                    if src_cell.has_style:
+                        try:
+                            dest_cell._style = copy(src_cell._style)
+                        except Exception:
+                            dest_cell.font = src_cell.font
+                            dest_cell.border = src_cell.border
+                            dest_cell.fill = src_cell.fill
+                            dest_cell.number_format = src_cell.number_format
+                            dest_cell.protection = src_cell.protection
+                            dest_cell.alignment = src_cell.alignment
+                    dest_cell.value = None
+
+            data_start_row = 8
+            pair_rows = pair_rows.reset_index(drop=True)
+            for idx_row, record in pair_rows.iterrows():
+                excel_row = data_start_row + idx_row
+                numero_factura = str(record.get("NUMERO_FACTURA", "")).strip()
+                codigo_glosa = str(record.get("CODIGOS_GLOSA", "")).strip()
+                contrato = str(record.get("CONTRATO", "")).strip()
+                valor_factura = parse_decimal(record.get("VALOR_TOTAL_SERVICIO"))
+                fecha_inicio = record.get("FECHA_INICIO", "")
+                fecha_dt = parse_fecha(fecha_inicio)
+                valor_glosa = parse_decimal(record.get("VALOR_GLOSA"))
+                try:
+                    total_glosa += parse_decimal_maybe_comma(str(record.get("VALOR_GLOSA", "0")))
+                except Exception:
+                    pass
+                valor_eps = parse_decimal(record.get("VALOR_ACEPTADO_POR_EPS"))
+                try:
+                    total_eps += parse_decimal_maybe_comma(str(record.get("VALOR_ACEPTADO_POR_EPS", "0")))
+                except Exception:
+                    pass
+                valor_ips = parse_decimal(record.get("VALOR_ACEPTADO_POR_IPS"))
+                try:
+                    total_ips += parse_decimal_maybe_comma(str(record.get("VALOR_ACEPTADO_POR_IPS", "0")))
+                except Exception:
+                    pass
+                valor_rat = parse_decimal(record.get("VALOR_RATIFICADO_EPS"))
+                try:
+                    total_rat += parse_decimal_maybe_comma(str(record.get("VALOR_RATIFICADO_EPS", "0")))
+                except Exception:
+                    pass
+                justificacion = str(record.get("OBSERVACIONES", "")).strip()
+
+                ws.cell(row=excel_row, column=1, value=numero_factura)
+                ws.cell(row=excel_row, column=2, value=numero_factura)
+                ws.cell(row=excel_row, column=3, value=codigo_glosa)
+                ws.cell(row=excel_row, column=4, value=contrato)
+                cell_valor_factura = ws.cell(row=excel_row, column=5, value=valor_factura)
+                apply_currency(cell_valor_factura)
+
+                if fecha_dt:
+                    cell_fecha = ws.cell(row=excel_row, column=6, value=fecha_dt)
+                    cell_fecha.number_format = "DD/MM/YYYY"
+                else:
+                    ws.cell(row=excel_row, column=6, value=str(fecha_inicio))
+
+                ws.cell(row=excel_row, column=7, value=departamento)
+                cell_valor_glosa = ws.cell(row=excel_row, column=8, value=valor_glosa)
+                apply_currency(cell_valor_glosa)
+                cell_pendiente = ws.cell(row=excel_row, column=9, value=0)
+                apply_currency(cell_pendiente)
+                cell_valor_eps = ws.cell(row=excel_row, column=10, value=valor_eps)
+                apply_currency(cell_valor_eps)
+                cell_valor_ips = ws.cell(row=excel_row, column=11, value=valor_ips)
+                apply_currency(cell_valor_ips)
+                cell_valor_rat = ws.cell(row=excel_row, column=12, value=valor_rat)
+                apply_currency(cell_valor_rat)
+                ws.cell(row=excel_row, column=13, value=justificacion)
+
+            data_end_row = data_start_row + row_count - 1
+            row_shift = row_count - 1
+            results_row = 9 + row_shift
+
+            for col in ("E", "H", "I", "J", "K", "L"):
+                cell = ws[f"{col}{results_row}"]
+                cell.value = f"=SUM({col}{data_start_row}:{col}{data_end_row})"
+                apply_currency(cell)
+
+            for offset, source_col in enumerate(["E", "H", "I", "J", "K", "L"], start=12):
+                target_cell = ws[f"C{offset + row_shift}"]
+                target_cell.value = f"={source_col}{results_row}"
+                apply_currency(target_cell)
+
+            footer_row = 19 + row_shift
+            month_name = month_names.get(current_dt.month, "")
+            footer_text = (
+                "La presente acta se expide en la ciudad de CARTAGENA, el día "
+                f"{current_dt.day} del mes de {month_name} de {current_dt.year} "
+                "y se suscribe por los funcionarios representates de las entidades que participan en el proceso de conciliación."
+            )
+            ws[f"A{footer_row}"] = footer_text
+
+            timestamp = current_dt.strftime("%Y%m%d_%H%M%S")
+            safe_nit = ''.join(ch for ch in str(nit) if ch.isalnum()) or "sin_nit"
+            out_path = acta_dir / f"acta_conciliacion_{safe_nit}_{timestamp}.xlsx"
+            try:
+                wb.save(out_path)
+            except TypeError as exc:
+                if not format_error_reported:
+                    error(
+                        "No se pudo guardar el acta con el formato monetario personalizado; se usará el formato alterno. "
+                        f"Detalle: {exc}"
+                    )
+                    format_error_reported = True
+                for cell in currency_cells:
+                    try:
+                        cell.number_format = fallback_currency_format
+                    except Exception:
+                        pass
+                wb.save(out_path)
+
+            sum_glosa = total_glosa.quantize(Decimal('0.01'))
+            sum_eps = total_eps.quantize(Decimal('0.01'))
+            sum_ips = total_ips.quantize(Decimal('0.01'))
+            sum_rat = total_rat.quantize(Decimal('0.01'))
+
+            record_info = {
+                'nit': nit,
+                'razon_social': razon_social,
+                'file_name': out_path.name,
+                'file_path': str(out_path),
+                'download_link': str(out_path),
+                'valor_glosa': str(sum_glosa),
+                'valor_aceptado_eps': str(sum_eps),
+                'valor_aceptado_ips': str(sum_ips),
+                'valor_ratificado': str(sum_rat),
+            }
+            generated_records.append(record_info)
+
+            if conn is not None:
+                try:
+                    now_utc = datetime.utcnow()
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO conciliation_acts (
+                                nit, file_name, file_path,
+                                valor_glosa, valor_aceptado_eps, valor_aceptado_ips, valor_ratificado,
+                                usuario, created_at, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                nit,
+                                out_path.name,
+                                str(out_path),
+                                sum_glosa,
+                                sum_eps,
+                                sum_ips,
+                                sum_rat,
+                                usuario_default,
+                                now_utc,
+                                now_utc,
+                            ),
+                        )
+                    conn.commit()
+                except Exception as db_exc:
+                    error(f"No se pudo registrar el acta en conciliation_acts: {db_exc}")
+        except Exception as exc:
+            error(f"No se pudo generar acta para el NIT {nit or 'desconocido'}: {exc}")
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+
+    return generated_records
 
 def get_mysql_conn_from_env():
     host = os.getenv("MYSQL_HOST")
@@ -361,7 +762,7 @@ def mysql_phase_and_success_report(df: pd.DataFrame, out_dir: str, ids: list[str
                 write_errors_csv(errors, out_err)
                 if not ids_to_process:
                     info("Todos los servicios del CSV ya estaban conciliados; generando reporte base…")
-                    return _generate_success_join(conn, out_dir, ids)
+                    return _finalize_success(conn, df, out_dir, ids)
 
             # 1) Preparar los registros a insertar desde el DataFrame (solo IDs a procesar)
             info(f"Preparando datos para inserción masiva (pendientes: {len(ids_to_process)})…")
@@ -470,10 +871,39 @@ WHERE cr.id IS NULL
             cur.execute(insert_bulk_sql)
             inserted = cur.rowcount  # filas insertadas
             info(f"Inserción masiva completada. Registros insertados: {inserted}")
+
+            if inserted > 0:
+                info("Actualizando tabla thirds_summary_conciliation con los nuevos valores…")
+                update_summary_sql = """
+INSERT INTO thirds_summary_conciliation (
+  nit,
+  valor_aceptado_eps,
+  valor_aceptado_ips,
+  valor_ratificado
+)
+SELECT
+  ia.third_id AS nit,
+  SUM(tmp.accepted_value_eps) AS valor_aceptado_eps,
+  SUM(tmp.accepted_value_ips) AS valor_aceptado_ips,
+  SUM(tmp.eps_ratified_value) AS valor_ratificado
+FROM tmp_conciliation_in tmp
+INNER JOIN auditory_final_reports afr
+  ON afr.id COLLATE utf8mb4_unicode_ci = tmp.afr_id COLLATE utf8mb4_unicode_ci
+INNER JOIN invoice_audits ia
+  ON ia.id COLLATE utf8mb4_unicode_ci = afr.factura_id COLLATE utf8mb4_unicode_ci
+GROUP BY ia.third_id
+ON DUPLICATE KEY UPDATE
+  valor_aceptado_eps = valor_aceptado_eps + VALUES(valor_aceptado_eps),
+  valor_aceptado_ips = valor_aceptado_ips + VALUES(valor_aceptado_ips),
+  valor_ratificado  = valor_ratificado  + VALUES(valor_ratificado)
+"""
+                cur.execute(update_summary_sql)
+                info("Resumen actualizado correctamente.")
+
             conn.commit()
 
             # 4) Generar CSV de éxito (JOIN filtrado por IDs del CSV)
-            return _generate_success_join(conn, out_dir, ids)
+            return _finalize_success(conn, df, out_dir, ids)
 
     except Exception as ex:
         # Registrar el error SQL por cada ID que intentábamos procesar
@@ -493,6 +923,22 @@ WHERE cr.id IS NULL
             pass
 
 # ------------------------ Reporte de éxito ------------------------
+
+def _finalize_success(conn, df: pd.DataFrame, out_dir: str, ids: list[str]) -> tuple[bool, str, str]:
+    try:
+        ok, message, success_path = _generate_success_join(conn, out_dir, ids)
+    except Exception as exc:
+        return False, f"Error generando reporte de éxito: {exc}", ''
+    if ok:
+        try:
+            acta_records = generate_acta_excels(df, ids, out_dir, conn)
+            if acta_records:
+                info("Actas de conciliación generadas:")
+                for record in acta_records:
+                    info(f"  - NIT {record.get('nit')}: {record.get('download_link')}")
+        except Exception as exc:
+            error(f"No se pudieron generar las actas de conciliación: {exc}")
+    return ok, message, success_path
 
 def _generate_success_join(conn, out_dir: str, ids: list[str]) -> tuple[bool, str, str]:
     """
