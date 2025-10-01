@@ -257,164 +257,135 @@ def format_decimal_value(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}".replace(".", ",")
 
 
-def generate_percentage_sheet(excel_file, perc_ips: float, perc_eps: float, perc_rat: float):
+def generate_percentage_sheet(file_obj, pct_ips: float, pct_eps: float, pct_rat: float):
+    """Devuelve (df_out, resumen_str, csv_bytes).
+       - Lee Excel (openpyxl), valida columnas mínimas.
+       - Distribuye VALOR_GLOSA: IPS→EPS→RAT (tope por fila).
+       - Ajusta redondeos para casar objetivos exactos.
+       - Sobrescribe OBSERVACIONES según reglas.
+       - Devuelve CSV (sep=';', coma decimal) en bytes."""
+    import pandas as pd
+    from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+    import io
+
+    # ---- lectura ----
     try:
-        df = pd.read_excel(excel_file, dtype=str)
+        df = pd.read_excel(file_obj, dtype=str, engine="openpyxl")
     except Exception as exc:
-        raise ValueError(f"No fue posible leer el Excel: {exc}") from exc
+        raise ValueError(f"No fue posible leer el Excel: {exc}")
 
-    expected_headers = EXPECTED_HEADERS
-    if list(df.columns) != expected_headers:
-        raise ValueError("Las columnas del Excel no coinciden con la especificación.")
+    # ---- validación mínima ----
+    REQUIRED_COLS = {"ID","NIT","RAZON_SOCIAL","NUMERO_FACTURA",
+                     "VALOR_GLOSA","VALOR_ACEPTADO_POR_IPS",
+                     "VALOR_ACEPTADO_POR_EPS","VALOR_RATIFICADO_EPS","OBSERVACIONES"}
+    headers = [(h or "").strip() for h in list(df.columns)]
+    miss = [c for c in REQUIRED_COLS if c not in headers]
+    if miss:
+        raise ValueError("Faltan columnas obligatorias: " + ", ".join(sorted(miss)))
 
-    df = df.fillna("")
-    try:
-        glosa_values = [parse_decimal_value(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) for val in df["VALOR_GLOSA"].tolist()]
-    except Exception as exc:
-        raise ValueError(f"VALOR_GLOSA contiene valores inválidos: {exc}")
+    # ---- utilidades ----
+    def _to_dec(s):
+        t = str(s).strip().replace("$","").replace(" ","")
+        if t == "": return Decimal("0")
+        if "," in t: t = t.replace(".","").replace(",",".")
+        return Decimal(t)
+    q = Decimal("0.01")
 
-    total_glosa = sum(glosa_values, Decimal("0"))
+    # ---- totales y objetivos ----
+    vals = []
+    for v in df["VALOR_GLOSA"].tolist():
+        try:
+            d = _to_dec(v)
+            if d < 0: d = Decimal("0")
+        except InvalidOperation:
+            d = Decimal("0")
+        vals.append(d)
+    total_glosa = sum(vals)
+    objetivo_ips = (total_glosa * Decimal(pct_ips)/Decimal(100)).quantize(q, rounding=ROUND_HALF_UP)
+    objetivo_eps = (total_glosa * Decimal(pct_eps)/Decimal(100)).quantize(q, rounding=ROUND_HALF_UP)
+    objetivo_rat = (total_glosa * Decimal(pct_rat)/Decimal(100)).quantize(q, rounding=ROUND_HALF_UP)
 
-    suma_pct = Decimal(str(perc_ips + perc_eps + perc_rat))
-    if abs(suma_pct - Decimal("100")) > Decimal("0.001"):
-        raise ValueError("La suma de los porcentajes debe ser 100%.")
+    # ---- distribución greedy ----
+    df2 = df.copy()
+    for col in ["VALOR_ACEPTADO_POR_IPS","VALOR_ACEPTADO_POR_EPS","VALOR_RATIFICADO_EPS"]:
+        df2[col] = "0"
+    rem_ips, rem_eps, rem_rat = objetivo_ips, objetivo_eps, objetivo_rat
+    for i in range(len(df2)):
+        glosa = _to_dec(df2.at[i,"VALOR_GLOSA"])
+        cap = glosa
+        if rem_ips>0 and cap>0:
+            take=min(cap,rem_ips).quantize(q,ROUND_HALF_UP)
+            df2.at[i,"VALOR_ACEPTADO_POR_IPS"]=str(take); rem_ips-=take; cap-=take
+        if rem_eps>0 and cap>0:
+            take=min(cap,rem_eps).quantize(q,ROUND_HALF_UP)
+            df2.at[i,"VALOR_ACEPTADO_POR_EPS"]=str(take); rem_eps-=take; cap-=take
+        if rem_rat>0 and cap>0:
+            take=min(cap,rem_rat).quantize(q,ROUND_HALF_UP)
+            df2.at[i,"VALOR_RATIFICADO_EPS"]=str(take); rem_rat-=take; cap-=take
 
-    objetivo_ips = (total_glosa * Decimal(str(perc_ips)) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    objetivo_eps = (total_glosa * Decimal(str(perc_eps)) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    objetivo_rat = (total_glosa * Decimal(str(perc_rat)) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    # ---- ajuste por redondeo para casar objetivos ----
+    def _ajusta(df2,col,obj):
+        actual=sum(_to_dec(x) for x in df2[col]); diff=obj-actual
+        if diff==0: return
+        for j in reversed(range(len(df2))):
+            glosa=_to_dec(df2.at[j,"VALOR_GLOSA"])
+            ips=_to_dec(df2.at[j,"VALOR_ACEPTADO_POR_IPS"])
+            eps=_to_dec(df2.at[j,"VALOR_ACEPTADO_POR_EPS"])
+            rat=_to_dec(df2.at[j,"VALOR_RATIFICADO_EPS"])
+            usado=ips+eps+rat
+            if diff>0:
+                cap=glosa-usado
+                if cap<=0: continue
+                delta=min(cap,diff).quantize(q,ROUND_HALF_UP)
+                df2.at[j, col]=str((_to_dec(df2.at[j,col])+delta).quantize(q,ROUND_HALF_UP)); break
+            else:
+                cap=_to_dec(df2.at[j,col])
+                if cap<=0: continue
+                delta=min(cap,-diff).quantize(q,ROUND_HALF_UP)
+                df2.at[j, col]=str((_to_dec(df2.at[j,col])-delta).quantize(q,ROUND_HALF_UP)); break
+    _ajusta(df2,"VALOR_ACEPTADO_POR_IPS",objetivo_ips)
+    _ajusta(df2,"VALOR_ACEPTADO_POR_EPS",objetivo_eps)
+    _ajusta(df2,"VALOR_RATIFICADO_EPS",objetivo_rat)
 
-    n = len(df)
-    ips_vals = [Decimal("0")] * n
-    eps_vals = [Decimal("0")] * n
-    rat_vals = [Decimal("0")] * n
-
-    def remaining_capacity(idx: int) -> Decimal:
-        return max(glosa_values[idx] - (ips_vals[idx] + eps_vals[idx] + rat_vals[idx]), Decimal("0"))
-
-    def assign_phase(values: list[Decimal], objetivo: Decimal):
-        restante = objetivo
-        for idx in range(n):
-            if restante <= Decimal("0"):
-                break
-            cap = remaining_capacity(idx)
-            if cap <= Decimal("0"):
-                continue
-            asignar = min(cap, restante)
-            asignar = asignar.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            values[idx] += asignar
-            restante = (restante - asignar).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        return restante
-
-    restante_ips = assign_phase(ips_vals, objetivo_ips)
-    restante_eps = assign_phase(eps_vals, objetivo_eps)
-    restante_rat = assign_phase(rat_vals, objetivo_rat)
-
-    def adjust(values: list[Decimal], objetivo: Decimal):
-        diff = (objetivo - sum(values, Decimal("0"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        if diff == Decimal("0"):
-            return
-        if diff > Decimal("0"):
-            for idx in range(n):
-                if diff <= Decimal("0"):
-                    break
-                cap = remaining_capacity(idx)
-                if cap <= Decimal("0"):
-                    continue
-                ajuste = min(cap, diff)
-                ajuste = ajuste.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                if ajuste <= Decimal("0"):
-                    continue
-                values[idx] += ajuste
-                diff = (diff - ajuste).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    # ---- OBSERVACIONES ----
+    obs=[]
+    for i in range(len(df2)):
+        glosa=_to_dec(df2.at[i,"VALOR_GLOSA"])
+        ips=_to_dec(df2.at[i,"VALOR_ACEPTADO_POR_IPS"])
+        eps=_to_dec(df2.at[i,"VALOR_ACEPTADO_POR_EPS"])
+        rat=_to_dec(df2.at[i,"VALOR_RATIFICADO_EPS"])
+        if ips==glosa and eps==0 and rat==0:
+            txt="EL PRESTADOR ACEPTA EL VALOR"
+        elif ips==glosa:
+            txt="SE LEVANTA GLOSA, EL PRESTADOR PRESENTA LOS SOPORTES NECESARIOS"
+        elif ips>0 and eps>0:
+            txt="SE LEVANTA GLOSA PARCIAL, EL PRESTADOR ADJUNTA LOS SOPORTES NECESARIOS PARA LA GLOSA APLICADA Y ADICIONAN EL CONTRATO Y ANEXOS DEL MISMO"
+        elif rat>0 and ips==0 and eps==0:
+            txt="SE RATIFICA LA GLOSA"
+        elif ips>0 and rat>0:
+            txt="SE LEVANTA GLOSA PARCIAL, EL PRESTADOR PRESENTA LOS SOPORTES NECESARIOS, SE RATIFICA GLOSA PARCIAL"
+        elif eps>0 and rat>0:
+            txt="EPS ACEPTA GLOSA PARCIAL, SE RATIFICA GLOSA PARCIAL"
         else:
-            diff = abs(diff)
-            for idx in range(n - 1, -1, -1):
-                if diff <= Decimal("0"):
-                    break
-                disponible = values[idx]
-                if disponible <= Decimal("0"):
-                    continue
-                ajuste = min(disponible, diff)
-                ajuste = ajuste.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                if ajuste <= Decimal("0"):
-                    continue
-                values[idx] -= ajuste
-                diff = (diff - ajuste).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            txt=str(df2.at[i,"OBSERVACIONES"] or "").strip()
+        obs.append(txt)
+    df2["OBSERVACIONES"]=obs
 
-    adjust(ips_vals, objetivo_ips)
-    adjust(eps_vals, objetivo_eps)
-    adjust(rat_vals, objetivo_rat)
+    # ---- resumen y CSV (sep=';' + coma decimal) ----
+    sum_ips=sum(_to_dec(x) for x in df2["VALOR_ACEPTADO_POR_IPS"])
+    sum_eps=sum(_to_dec(x) for x in df2["VALOR_ACEPTADO_POR_EPS"])
+    sum_rat=sum(_to_dec(x) for x in df2["VALOR_RATIFICADO_EPS"])
+    resumen=f"total_glosa={total_glosa} | objetivo ips/eps/rat=({objetivo_ips},{objetivo_eps},{objetivo_rat}) | asignado=({sum_ips},{sum_eps},{sum_rat})"
 
-    df_out = df.copy()
-    df_out["VALOR_ACEPTADO_POR_IPS"] = [format_decimal_value(v) for v in ips_vals]
-    df_out["VALOR_ACEPTADO_POR_EPS"] = [format_decimal_value(v) for v in eps_vals]
-    df_out["VALOR_RATIFICADO_EPS"] = [format_decimal_value(v) for v in rat_vals]
+    num_cols=["VALOR_ACEPTADO_POR_IPS","VALOR_ACEPTADO_POR_EPS","VALOR_RATIFICADO_EPS","VALOR_GLOSA","VALOR_TOTAL_SERVICIO"]
+    df_out=df2.copy()
+    for c in num_cols:
+        if c in df_out.columns:
+            df_out[c]=df_out[c].astype(str).str.replace(".",",",regex=False)
 
-    nuevas_obs = []
-    for glosa, ips, eps, rat, original in zip(
-        glosa_values,
-        ips_vals,
-        eps_vals,
-        rat_vals,
-        df.get("OBSERVACIONES", pd.Series([""] * n))
-    ):
-        ips_v = ips.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        eps_v = eps.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        rat_v = rat.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        glosa_v = glosa.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-        if ips_v == glosa_v and eps_v == Decimal("0") and rat_v == Decimal("0"):
-            nuevas_obs.append("EL PRESTADOR ACEPTA EL VALOR")
-        elif ips_v == glosa_v:
-            nuevas_obs.append("SE LEVANTA GLOSA, EL PRESTADOR PRESENTA LOS SOPORTES NECESARIOS")
-        elif ips_v > Decimal("0") and eps_v > Decimal("0") and rat_v == Decimal("0"):
-            nuevas_obs.append(
-                "SE LEVANTA GLOSA PARCIAL, EL PRESTADOR ADJUNTA LOS SOPORTES NECESARIOS PARA LA GLOSA APLICADA Y ADICIONAN EL CONTRATO Y ANEXOS DEL MISMO"
-            )
-        elif rat_v == glosa_v and ips_v == Decimal("0") and eps_v == Decimal("0"):
-            nuevas_obs.append("SE RATIFICA LA GLOSA")
-        elif ips_v > Decimal("0") and rat_v > Decimal("0"):
-            nuevas_obs.append(
-                "SE LEVANTA GLOSA PARCIAL, EL PRESTADOR PRESENTA LOS SOPORTES NECESARIOS, SE RATIFICA GLOSA PARCIAL"
-            )
-        elif eps_v > Decimal("0") and rat_v > Decimal("0"):
-            nuevas_obs.append("EPS ACEPTA GLOSA PARCIAL, SE RATIFICA GLOSA PARCIAL")
-        else:
-            nuevas_obs.append(str(original))
-
-    df_out["OBSERVACIONES"] = nuevas_obs
-
-    numeric_cols = [
-        "VALOR_GLOSA",
-        "VALOR_TOTAL_SERVICIO",
-        "VALOR_ACEPTADO_POR_IPS",
-        "VALOR_ACEPTADO_POR_EPS",
-        "VALOR_RATIFICADO_EPS",
-    ]
-    for col in numeric_cols:
-        if col in df_out.columns:
-            df_out[col] = [format_decimal_value(parse_decimal_value(val)) for val in df_out[col]]
-
-    csv_buffer = StringIO()
-    df_out.to_csv(
-        csv_buffer,
-        index=False,
-        sep=";",
-        encoding="utf-8",
-        lineterminator="\n",
-        quoting=csv.QUOTE_MINIMAL,
-    )
-    resumen = {
-        "total_glosa": format_decimal_value(total_glosa),
-        "objetivo_ips": format_decimal_value(objetivo_ips),
-        "objetivo_eps": format_decimal_value(objetivo_eps),
-        "objetivo_rat": format_decimal_value(objetivo_rat),
-        "asignado_ips": format_decimal_value(sum(ips_vals, Decimal("0"))),
-        "asignado_eps": format_decimal_value(sum(eps_vals, Decimal("0"))),
-        "asignado_rat": format_decimal_value(sum(rat_vals, Decimal("0"))),
-    }
-
-    return df_out, csv_buffer.getvalue().encode("utf-8"), resumen
+    buf=io.StringIO()
+    df_out.to_csv(buf,index=False,sep=";",lineterminator="\n")
+    return df_out, resumen, buf.getvalue().encode("utf-8")
 
 def render_state_form(cfg: dict, nit: str, razon: str | None, prefix: str) -> None:
     estado_key = f"{prefix}_estado"
@@ -689,48 +660,6 @@ def render_loader_page():
     log_box = st.empty()
     status_box = st.empty()
 
-    with st.expander("Generar sábana por %"):
-        excel_percentage = st.file_uploader("Excel", type=["xlsx"], key="percentage_excel")
-        col_ips, col_eps, col_rat = st.columns(3)
-        perc_ips = col_ips.number_input("% IPS", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key="perc_ips")
-        perc_eps = col_eps.number_input("% EPS", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key="perc_eps")
-        perc_rat = col_rat.number_input("% RAT", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key="perc_rat")
-        if st.button("Generar sábana", key="generate_percentage_button"):
-            if excel_percentage is None:
-                st.error("Debes subir un Excel de conciliación.")
-            else:
-                try:
-                    _, csv_bytes, resumen = generate_percentage_sheet(
-                        excel_percentage,
-                        perc_ips,
-                        perc_eps,
-                        perc_rat,
-                    )
-                except Exception as exc:
-                    st.error(str(exc))
-                else:
-                    st.session_state["percentage_csv"] = csv_bytes
-                    st.session_state["percentage_summary"] = resumen
-                    st.success("Sábana generada correctamente.")
-        if st.session_state.get("percentage_csv"):
-            resumen = st.session_state.get("percentage_summary", {})
-            if resumen:
-                st.markdown(
-                    "\n".join(
-                        [
-                            f"**{k.replace('_', ' ').title()}:** {v}"
-                            for k, v in resumen.items()
-                        ]
-                    )
-                )
-            st.download_button(
-                "Descargar sábana por %",
-                data=st.session_state["percentage_csv"],
-                file_name="sabana_porcentajes.csv",
-                mime="text/csv",
-                key="download_percentage_csv",
-            )
-
     if st.session_state.running and st.session_state.proc:
         status_box.info("Proceso en ejecución… leyendo logs en tiempo real.")
         for _ in range(2000):
@@ -780,6 +709,63 @@ def render_loader_page():
             color="neutral",
         )
 
+    with st.expander("Descargar actas de conciliación", expanded=False):
+        nit_filter = st.text_input("Filtrar por NIT (opcional)")
+        try:
+            cfg, missing = get_db_config()
+            if missing:
+                st.warning("Faltan variables de entorno MySQL para listar actas.")
+            else:
+                import pymysql, os
+                conn = pymysql.connect(
+                    host=cfg["host"], port=cfg["port"], user=cfg["user"],
+                    password=cfg["password"], database=cfg["database"],
+                    cursorclass=pymysql.cursors.Cursor,
+                )
+                try:
+                    with conn.cursor() as cur:
+                        if nit_filter:
+                            cur.execute("""
+                              SELECT nit, file_name, file_path, valor_glosa,
+                                     valor_aceptado_eps, valor_aceptado_ips, valor_ratificado,
+                                     usuario, created_at
+                              FROM conciliation_acta_files
+                              WHERE nit = %s
+                              ORDER BY created_at DESC
+                              LIMIT 200
+                            """, (nit_filter,))
+                        else:
+                            cur.execute("""
+                              SELECT nit, file_name, file_path, valor_glosa,
+                                     valor_aceptado_eps, valor_aceptado_ips, valor_ratificado,
+                                     usuario, created_at
+                              FROM conciliation_acta_files
+                              ORDER BY created_at DESC
+                              LIMIT 200
+                            """)
+                        rows = cur.fetchall()
+                        cols = [d[0] for d in cur.description]
+                        import pandas as pd
+                        df_act = pd.DataFrame(rows, columns=cols)
+                        st.dataframe(df_act, use_container_width=True)
+                        from pathlib import Path
+                        for _, r in df_act.iterrows():
+                            p = Path(str(r["file_path"]))
+                            if p.exists():
+                                with open(p, "rb") as f:
+                                    st.download_button(
+                                        f"⬇️ Descargar {r['file_name']} (NIT {r['nit']})",
+                                        data=f.read(),
+                                        file_name=r["file_name"],
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    )
+                            else:
+                                st.warning(f"Archivo no encontrado: {p}")
+                finally:
+                    conn.close()
+        except Exception as ex:
+            st.error(f"No fue posible listar actas: {ex}")
+
     with st.expander("Generar sábana por %", expanded=False):
         pct_file = st.file_uploader(
             "Excel de conciliación",
@@ -812,27 +798,30 @@ def render_loader_page():
             key="pct_rat",
         )
 
-        if st.button("Generar sábana", key="btn_gen_pct"):
-            if pct_file is None:
+        st.button("Generar sábana", key="btn_gen_pct")
+        if st.session_state.get("btn_gen_pct") or st.button("Generar sábana", key="btn_gen_pct_fire"):
+            file_obj = st.session_state.get("pct_excel_upl")
+            ips = st.session_state.get("pct_ips", 0.0)
+            eps = st.session_state.get("pct_eps", 0.0)
+            rat = st.session_state.get("pct_rat", 0.0)
+            if not file_obj:
                 st.error("Sube un Excel primero.")
+            elif abs((ips + eps + rat) - 100.0) > 0.001:
+                st.error("Los porcentajes deben sumar 100%.")
             else:
-                total_pct = pct_ips + pct_eps + pct_rat
-                if abs(total_pct - 100.0) > 0.001:
-                    st.error("Los porcentajes deben sumar 100%.")
-                else:
-                    try:
-                        df_pct, resumen = generate_percentage_sheet(
-                            pct_file,
-                            pct_ips,
-                            pct_eps,
-                            pct_rat,
-                        )
-                    except ValueError as exc:
-                        st.error(str(exc))
-                    else:
-                        st.success("Archivo válido. Pendiente de cálculos.")
-                        st.text(resumen)
-                        st.dataframe(df_pct.head(10), use_container_width=True)
+                try:
+                    df_out, resumen, csv_bytes = generate_percentage_sheet(file_obj, ips, eps, rat)
+                    st.success("Sábana generada.")
+                    st.dataframe(df_out.head(15), use_container_width=True)
+                    st.code(resumen)
+                    st.download_button(
+                        "Descargar sábana por %",
+                        data=csv_bytes,
+                        file_name="sabana_porcentajes.csv",
+                        mime="text/csv",
+                    )
+                except Exception as exc:
+                    st.error(f"No se pudo generar la sábana: {exc}")
 
 
 def main():

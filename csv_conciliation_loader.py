@@ -527,27 +527,23 @@ LIMIT 1
 
             if conn is not None:
                 try:
-                    now_utc = datetime.utcnow()
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            INSERT INTO conciliation_acts (
-                                nit, file_name, file_path,
-                                valor_glosa, valor_aceptado_eps, valor_aceptado_ips, valor_ratificado,
-                                usuario, created_at, updated_at
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                INSERT INTO conciliation_acta_files
+                                (nit, file_name, file_path, valor_glosa, valor_aceptado_eps,
+                                 valor_aceptado_ips, valor_ratificado, usuario, created_at, updated_at)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s, NOW(), NOW())
                             """,
                             (
                                 nit,
                                 out_path.name,
                                 str(out_path),
-                                sum_glosa,
-                                sum_eps,
-                                sum_ips,
-                                sum_rat,
+                                str(sum_glosa),
+                                str(sum_eps),
+                                str(sum_ips),
+                                str(sum_rat),
                                 usuario_default,
-                                now_utc,
-                                now_utc,
                             ),
                         )
                     conn.commit()
