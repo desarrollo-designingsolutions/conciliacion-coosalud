@@ -580,7 +580,11 @@ def run_job(csv_path: Path, verbose: bool = True):
             LOG_FILE.unlink()
     except Exception:
         pass
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    env = os.environ.copy()
+    user_email = st.session_state.get("user_email") or env.get("ACTA_GENERATION_USER")
+    if user_email:
+        env["ACTA_GENERATION_USER"] = user_email
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
 
 
 def file_to_download_button(label: str, path: Path, color: str = "neutral"):

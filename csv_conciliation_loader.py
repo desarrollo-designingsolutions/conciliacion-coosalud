@@ -527,16 +527,20 @@ LIMIT 1
 
             if conn is not None:
                 try:
+                    import uuid
+                    acta_id = str(uuid.uuid4())
                     with conn.cursor() as cur:
                         cur.execute(
                             """
                                 INSERT INTO conciliation_acta_files
-                                (nit, file_name, file_path, valor_glosa, valor_aceptado_eps,
+                                (id, nit, razon_social, file_name, file_path, valor_glosa, valor_aceptado_eps,
                                  valor_aceptado_ips, valor_ratificado, usuario, created_at, updated_at)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s, NOW(), NOW())
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW(), NOW())
                             """,
                             (
+                                acta_id,
                                 nit,
+                                razon_social,
                                 out_path.name,
                                 str(out_path),
                                 str(sum_glosa),
@@ -548,7 +552,7 @@ LIMIT 1
                         )
                     conn.commit()
                 except Exception as db_exc:
-                    error(f"No se pudo registrar el acta en conciliation_acts: {db_exc}")
+                    error(f"No se pudo registrar el acta en conciliation_acta_files: {db_exc}")
         except Exception as exc:
             error(f"No se pudo generar acta para el NIT {nit or 'desconocido'}: {exc}")
         finally:
