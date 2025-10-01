@@ -736,20 +736,43 @@ def render_loader_page():
                         cols = [d[0] for d in cur.description]
                         import pandas as pd
                         df_act = pd.DataFrame(rows, columns=cols)
-                        st.dataframe(df_act, width='stretch')
+                        # Construir columna de descarga dentro de la tabla usando data URLs
                         from pathlib import Path
+                        import base64
+                        download_urls = []
                         for _, r in df_act.iterrows():
-                            p = Path(str(r["file_path"]))
+                            p = Path(str(r.get("file_path", "")))
                             if p.exists():
-                                with open(p, "rb") as f:
-                                    st.download_button(
-                                        f"⬇️ Descargar {r['file_name']} (NIT {r['nit']})",
-                                        data=f.read(),
-                                        file_name=r["file_name"],
-                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                try:
+                                    with open(p, "rb") as f:
+                                        b64 = base64.b64encode(f.read()).decode()
+                                    url = (
+                                        "data:application/"
+                                        "vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + b64
                                     )
+                                except Exception:
+                                    url = ""
                             else:
-                                st.warning(f"Archivo no encontrado: {p}")
+                                url = ""
+                            download_urls.append(url)
+                        df_act["Descargar"] = download_urls
+
+                        # Mostrar como editor solo-lectura con columna Link
+                        # Evitar duplicar "Descargar" y ocultar "file_path"
+                        visible_cols = [c for c in df_act.columns if c not in ("file_path", "Descargar")] + ["Descargar"]
+                        df_view = df_act[[c for c in visible_cols if c in df_act.columns]]
+                        st.data_editor(
+                            df_view,
+                            width='stretch',
+                            hide_index=True,
+                            disabled=True,
+                            column_config={
+                                "Descargar": st.column_config.LinkColumn(
+                                    "Descargar",
+                                    display_text="⬇️ Descargar",
+                                )
+                            },
+                        )
                 finally:
                     conn.close()
         except Exception as ex:
