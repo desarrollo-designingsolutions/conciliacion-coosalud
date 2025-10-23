@@ -995,11 +995,76 @@ ORDER BY afr.id
         return False, f"Error generando reporte de éxito: {ex}", ""
 # ------------------------ main ------------------------
 
+def _write_dry_run_summary(df: pd.DataFrame, out_dir: str, ids_to_insert: list[str]) -> str:
+    """
+    Genera un resumen por NIT/RAZON_SOCIAL con columnas solicitadas y lo guarda
+    en out_dir/dry_run_summary.csv. Retorna la ruta del archivo.
+    """
+    try:
+        subset = df[df["ID"].isin(ids_to_insert)].copy()
+        # Asegurar tipos string para agrupación limpia
+        subset["NIT"] = subset["NIT"].astype(str)
+        subset["RAZON_SOCIAL"] = subset["RAZON_SOCIAL"].astype(str)
+
+        def _d(col):
+            return subset[col].apply(lambda x: parse_decimal_maybe_comma(str(x))).sum()
+
+        grp = subset.groupby(["NIT", "RAZON_SOCIAL"], dropna=False)
+        rows = []
+        for (nit, razon), g in grp:
+            cantidad = int(len(g))
+            try:
+                glosa = g["VALOR_GLOSA"].apply(lambda x: parse_decimal_maybe_comma(str(x))).sum()
+            except Exception:
+                glosa = Decimal("0")
+            try:
+                ips = g["VALOR_ACEPTADO_POR_IPS"].apply(lambda x: parse_decimal_maybe_comma(str(x))).sum()
+            except Exception:
+                ips = Decimal("0")
+            try:
+                eps = g["VALOR_ACEPTADO_POR_EPS"].apply(lambda x: parse_decimal_maybe_comma(str(x))).sum()
+            except Exception:
+                eps = Decimal("0")
+            try:
+                rat = g["VALOR_RATIFICADO_EPS"].apply(lambda x: parse_decimal_maybe_comma(str(x))).sum()
+            except Exception:
+                rat = Decimal("0")
+            rows.append([
+                str(nit or ""),
+                str(razon or ""),
+                cantidad,
+                f"{glosa}",
+                f"{ips}",
+                f"{eps}",
+                f"{rat}",
+            ])
+
+        out_path = os.path.join(out_dir, "dry_run_summary.csv")
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "NIT",
+                "RAZON_SOCIAL",
+                "CANTIDAD_FACTURAS",
+                "VALOR_GLOSA",
+                "VALOR_ACEPTADO_POR_IPS",
+                "VALOR_ACEPTADO_POR_EPS",
+                "VALOR_RATIFICADO_EPS",
+            ])
+            for row in rows:
+                w.writerow(row)
+        return out_path
+    except Exception as exc:
+        error(f"No se pudo generar resumen de dry-run: {exc}")
+        return ""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Ruta del CSV de entrada")
     ap.add_argument("--out-dir", required=True, help="Directorio de salida para reportes")
     ap.add_argument("--verbose", action="store_true", help="Muestra logs detallados en consola")
+    ap.add_argument("--dry-run", action="store_true", help="Solo validar y generar resumen; no inserta en MySQL")
     ap.add_argument("--log-file", default="/data/out/runtime.log",
                     help="Ruta del log (por defecto /data/out/runtime.log si existe /data/out)")
     args = ap.parse_args()
@@ -1065,8 +1130,48 @@ def main():
 
     info("Validaciones CSV OK ✅")
 
-    # Fase MySQL masiva (si hay credenciales)
+    # Fase MySQL o DRY-RUN
     ids = df["ID"].tolist()
+
+    if args.dry_run:
+        info("DRY-RUN habilitado: se validará conexión MySQL y se generará resumen, sin insertar.")
+        conn, err = get_mysql_conn_from_env()
+        already = set()
+        if conn is None:
+            info(f"No se validará contra MySQL: {err}")
+        else:
+            try:
+                with conn.cursor() as cur:
+                    info("Verificando conciliaciones existentes (dry-run)…")
+                    chunk_size = 1000
+                    for i in range(0, len(ids), chunk_size):
+                        chunk = ids[i:i+chunk_size]
+                        placeholders = ",".join(["%s"] * len(chunk))
+                        cur.execute(
+                            f"SELECT auditory_final_report_id FROM conciliation_results WHERE auditory_final_report_id IN ({placeholders})",
+                            chunk
+                        )
+                        already.update(row[0] for row in cur.fetchall())
+            except Exception as ex:
+                error(f"No fue posible consultar conciliaciones existentes en dry-run: {ex}")
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        ids_to_insert = [i for i in ids if i not in already]
+        if already:
+            info(f"IDs ya conciliados detectados en dry-run: {len(already)}; serán excluidos del resumen.")
+        else:
+            info("No se detectaron IDs ya conciliados en dry-run.")
+
+        summary_path = _write_dry_run_summary(df, args.out_dir, ids_to_insert)
+        if summary_path:
+            info(f"Resumen de dry-run generado en: {summary_path}")
+        info("=== Fin de DRY-RUN ===")
+        sys.exit(EXIT_OK)
+
     info(f"Validando contra MySQL e insertando masivamente (IDs a procesar: {len(ids)})…")
     ok, msg, success_csv = mysql_phase_and_success_report(df, args.out_dir, ids)
 

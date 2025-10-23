@@ -737,7 +737,7 @@ def tail_file(path: Path, from_bytes=0, max_lines=4000):
 
 
 
-def run_job(csv_path: Path, verbose: bool = True):
+def run_job(csv_path: Path, verbose: bool = True, dry_run: bool = False):
     cmd = [
         "python",
         "csv_conciliation_loader.py",
@@ -746,6 +746,8 @@ def run_job(csv_path: Path, verbose: bool = True):
     ]
     if verbose:
         cmd.append("--verbose")
+    if dry_run:
+        cmd.append("--dry-run")
     try:
         if LOG_FILE.exists():
             LOG_FILE.unlink()
@@ -757,6 +759,62 @@ def run_job(csv_path: Path, verbose: bool = True):
         env["ACTA_GENERATION_USER"] = user_email
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
 
+
+def render_confirmation_ui(df_sum: "pd.DataFrame") -> None:
+    """Muestra una ventana modal con el resumen y Confirmar/Cancelar.
+    Prioriza st.modal (context manager). Si no existe, usa st.dialog como decorador.
+    Si nada de eso existe, cae a un bloque en la página.
+    """
+    has_modal = hasattr(st, "modal")
+    has_dialog = hasattr(st, "dialog")
+
+    def _content():
+        st.subheader("Resumen de conciliación a registrar")
+        pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_sum.columns}
+        st.data_editor(df_sum, hide_index=True, disabled=True, column_config=pretty_cols, width='stretch')
+        st.markdown("")
+        st.info("¿Está seguro de cargar los datos y generar el acta de conciliación?")
+
+        confirm_col, cancel_col = st.columns([1, 1])
+        with confirm_col:
+            if st.button("Confirmar y registrar en SQL", type="primary"):
+                csv_path = st.session_state.get("last_csv_path")
+                if not csv_path:
+                    st.error("No se encontró la ruta del CSV cargado.")
+                else:
+                    st.session_state.proc = run_job(Path(csv_path), verbose=st.session_state.get("verbose", True), dry_run=False)
+                    st.session_state.running = True
+                    st.session_state.log_offset = 0
+                    st.session_state.last_result = "neutral"
+                    st.session_state.already_conciliated_detected = False
+                    st.session_state.phase = "inserting"
+                    st.session_state.show_confirm_modal = False
+                    st.success("Iniciando inserción en SQL…")
+                    rerun_app()
+        with cancel_col:
+            if st.button("Cancelar"):
+                st.session_state.phase = "idle"
+                st.session_state.pop("dry_run_df", None)
+                st.session_state.dry_run_summary_loaded = False
+                st.session_state.show_confirm_modal = False
+                st.info("Operación cancelada. No se insertaron datos.")
+                rerun_app()
+
+    if has_modal:
+        with st.modal("Confirmar conciliación"):
+            _content()
+    elif has_dialog:
+        # st.dialog es un decorador: lo aplicamos a _content y lo invocamos.
+        try:
+            show_dialog = st.dialog("Confirmar conciliación")(_content)
+            show_dialog()
+        except Exception:
+            # Fallback a bloque en página si la invocación falla
+            st.warning("No fue posible usar st.dialog; mostrando confirmación en la página.")
+            _content()
+    else:
+        st.warning("Tu versión de Streamlit no soporta modales; mostrando confirmación en la página.")
+        _content()
 
 def file_to_download_button(label: str, path: Path, color: str = "neutral"):
     if not path.exists():
@@ -804,6 +862,10 @@ def render_loader_page():
     st.session_state.setdefault("log_offset", 0)
     st.session_state.setdefault("last_result", "neutral")
     st.session_state.setdefault("already_conciliated_detected", False)
+    st.session_state.setdefault("phase", "idle")  # idle | dry_run | confirm | inserting
+    st.session_state.setdefault("last_csv_path", "")
+    st.session_state.setdefault("dry_run_summary_loaded", False)
+    st.session_state.setdefault("show_confirm_modal", False)
 
     if start_btn:
         if uploaded is None:
@@ -813,11 +875,16 @@ def render_loader_page():
             with open(dest, "wb") as f:
                 f.write(uploaded.getbuffer())
             st.success(f"Archivo guardado: {dest}")
-            st.session_state.proc = run_job(dest, verbose=verbose)
+            st.session_state.last_csv_path = str(dest)
+            st.session_state.verbose = bool(verbose)
+            # Fase 1: DRY-RUN
+            st.session_state.proc = run_job(dest, verbose=verbose, dry_run=True)
             st.session_state.running = True
             st.session_state.log_offset = 0
             st.session_state.last_result = "neutral"
             st.session_state.already_conciliated_detected = False
+            st.session_state.phase = "dry_run"
+            st.session_state.dry_run_summary_loaded = False
 
     log_box = st.empty()
     status_box = st.empty()
@@ -861,17 +928,48 @@ def render_loader_page():
                     ):
                         st.session_state.already_conciliated_detected = True
                 exit_code = st.session_state.proc.returncode
-                if st.session_state.already_conciliated_detected:
-                    status_box.error("Las facturas cargadas ya se encuentran conciliadas en el sistema.")
-                    st.session_state.last_result = "error"
-                elif exit_code == 0:
-                    status_box.success("Proceso finalizado OK ✅")
-                    st.session_state.last_result = "success"
+                phase = st.session_state.get("phase", "idle")
+                if phase == "dry_run":
+                    if exit_code == 0:
+                        status_box.success("Validación y resumen listos (DRY-RUN).")
+                        st.session_state.last_result = "neutral"
+                        # Pasar a fase de confirmación explícita y abrir modal
+                        st.session_state.phase = "confirm"
+                        st.session_state.show_confirm_modal = True
+                    else:
+                        status_box.error(f"DRY-RUN con errores ❌ (código {exit_code})")
+                        st.session_state.last_result = "error"
+                    st.session_state.running = False
                 else:
-                    status_box.error(f"Proceso finalizado con errores ❌ (código {exit_code})")
-                    st.session_state.last_result = "error"
-                st.session_state.running = False
+                    if st.session_state.already_conciliated_detected:
+                        status_box.error("Las facturas cargadas ya se encuentran conciliadas en el sistema.")
+                        st.session_state.last_result = "error"
+                    elif exit_code == 0:
+                        status_box.success("Proceso finalizado OK ✅")
+                        st.session_state.last_result = "success"
+                    else:
+                        status_box.error(f"Proceso finalizado con errores ❌ (código {exit_code})")
+                        st.session_state.last_result = "error"
+                    st.session_state.running = False
                 break
+
+    # Si DRY-RUN finalizó OK, cargar resumen y mostrar modal de confirmación
+    if st.session_state.get("phase") in ("dry_run", "confirm") and not st.session_state.get("running") and st.session_state.get("last_result") != "error":
+        summary_path = OUT_DIR / "dry_run_summary.csv"
+        if summary_path.exists() and not st.session_state.get("dry_run_summary_loaded"):
+            try:
+                df_sum = pd.read_csv(summary_path, dtype={"NIT": str, "RAZON_SOCIAL": str})
+                st.session_state["dry_run_df"] = df_sum
+                st.session_state["dry_run_summary_loaded"] = True
+            except Exception as exc:
+                st.warning(f"No fue posible leer el resumen de dry-run: {exc}")
+
+        df_sum = st.session_state.get("dry_run_df")
+        has_rows = bool(df_sum is not None and not df_sum.empty)
+        if has_rows and st.session_state.get("show_confirm_modal"):
+            render_confirmation_ui(df_sum)
+        elif not has_rows:
+            st.info("No hay filas nuevas para insertar (posiblemente ya conciliadas).")
 
     st.subheader("Descargar resultados")
     cols = st.columns(3)
@@ -939,7 +1037,6 @@ def render_loader_page():
                             """)
                         rows = cur.fetchall()
                         cols = [d[0] for d in cur.description]
-                        import pandas as pd
                         df_act = pd.DataFrame(rows, columns=cols)
                         if df_act.empty:
                             if nit_filter:
@@ -948,7 +1045,6 @@ def render_loader_page():
                                 st.info("Aún no hay actas registradas para descargar.")
                             return
                         # Construir columna de descarga dentro de la tabla usando data URLs
-                        from pathlib import Path
                         import base64
                         download_urls = []
                         for _, r in df_act.iterrows():
