@@ -12,18 +12,13 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
-# Copiar requirements e instalar dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar TODOS los archivos de la aplicación
-COPY . .
+COPY csv_conciliation_loader.py ./
 
-# Crear directorios necesarios
+# Directorios de IO (se montan como volúmenes con docker compose)
 RUN mkdir -p /data/in /data/out
 
-# Exponer puerto de Streamlit
-EXPOSE 8501
-
-# Ejecutar Streamlit por defecto (producción)
-CMD ["streamlit", "run", "app_streamlit.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+ENTRYPOINT ["python", "csv_conciliation_loader.py"]
+CMD ["--help"]

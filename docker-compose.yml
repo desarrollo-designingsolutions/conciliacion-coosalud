@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    image: csv_conciliation_docker-app   # añade la etiqueta para reutilizarla en web
+    image: csv_conciliation_docker-app
     container_name: csv_conciliation_app
     tty: true
     stdin_open: true
@@ -15,18 +15,17 @@ services:
       - ./csv_conciliation_loader.py:/app/csv_conciliation_loader.py:ro
       - ./data/in:/data/in:rw
       - ./data/out:/data/out:rw
-    # Este command solo aplica al servicio app (jobs CLI)
+    # Override para ejecutar el CLI
+    entrypoint: ["python", "csv_conciliation_loader.py"]
     command: ["--csv", "/data/in/tu_archivo.csv", "--out-dir", "/data/out", "--verbose"]
 
   web:
     image: csv_conciliation_docker-app
     container_name: csv_conciliation_ui
-    # override absoluto del entrypoint para saltarnos el loader por defecto
-    entrypoint: []
-    command: ["streamlit", "run", "app_streamlit.py", "--server.port=8501", "--server.address=0.0.0.0"]
     ports:
       - "8501:8501"
     env_file: .env
     volumes:
       - ./data:/data
       - ./:/app
+    # Ya no necesita override, usa el CMD del Dockerfile
