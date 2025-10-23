@@ -55,3 +55,14 @@ jobs:
 
       - name: Image digest
         run: echo "Image pushed successfully! ✅"
+
+      - name: Force ECS deployment
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          echo "Forcing ECS service to deploy new image..."
+          aws ecs update-service \
+            --cluster conciliacion-cluster \
+            --service conciliacion-svc \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+          echo "Deployment initiated! ✅"
