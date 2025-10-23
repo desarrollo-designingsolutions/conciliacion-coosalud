@@ -11,7 +11,7 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: creacion-de-actas
+  ECR_REPOSITORY: conciliacion-coosalud
 
 permissions:
   id-token: write   # Requerido para OIDC
