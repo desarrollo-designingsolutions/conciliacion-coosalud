@@ -63,7 +63,7 @@ LEFT JOIN (
   ON ns.nit = ts.nit
 """
 
-APP_TITLE = "actas de conciliacion"
+APP_TITLE = "actas de conciliacion Coosalud"
 IN_DIR = Path("/data/in")
 OUT_DIR = Path("/data/out")
 LOG_FILE = OUT_DIR / "runtime.log"
