@@ -14,7 +14,7 @@ env:
   ECR_REPOSITORY: conciliacion-coosalud
 
 permissions:
-  id-token: write   # Requerido para OIDC
+  id-token: write
   contents: read
 
 jobs:
