@@ -63,6 +63,16 @@ LEFT JOIN (
   ON ns.nit = ts.nit
 """
 
+RATIFICATION_SQL = """
+SELECT
+  id,
+  nit,
+  razon_social,
+  estado
+FROM direct_ratification
+ORDER BY id ASC
+"""
+
 APP_TITLE = "actas de conciliacion Coosalud"
 IN_DIR = Path("/data/in")
 OUT_DIR = Path("/data/out")
@@ -201,6 +211,28 @@ def load_summary_dataframe(cfg: dict):
     return df
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_ratification_dataframe(cfg: dict):
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        cursorclass=pymysql.cursors.Cursor,
+    )
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(RATIFICATION_SQL)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+    finally:
+        conn.close()
+
+    df = pd.DataFrame(rows, columns=columns)
+    return df
+
+
 def clear_state_form(prefix: str) -> None:
     st.session_state.pop(f"{prefix}_estado", None)
     st.session_state.pop(f"{prefix}_comentario", None)
@@ -265,6 +297,294 @@ def insert_acta_pdf_record(cfg: dict, id_str: str, nit: str, razon_social: str, 
         conn.close()
 
 
+def get_ratification_data(cfg: dict, third_id: str):
+    """Obtiene los datos de ratificación para un third_id específico."""
+    query = """
+    SELECT
+        UUID() AS id,
+        afr.id AS auditory_final_report_id,
+        afr.factura_id AS invoice_audit_id,
+        '6a88eda0-6e06-11f0-bccc-0e6812ec9c15' AS reconciliation_group_id,
+        'ratificacion' AS response_status,
+        null AS autorization_number,
+        0 AS accepted_value_eps,
+        0 AS accepted_value_ips,
+        afr.valor_glosa AS eps_ratified_value,
+        'Se mantiene la glosa formulada por cuanto el prestador de servicios de salud a pesar de las notificaciones realizadas no presenta animo conciliatorio, como se evidencia en los soportes adjuntos' AS observation,
+        NOW() AS created_at,
+        NOW() AS updated_at
+    FROM auditory_final_reports afr
+    INNER JOIN invoice_audits ia
+        ON ia.id = afr.factura_id
+    INNER JOIN estados_auditory_final_reports eafr
+            ON eafr.ID = afr.id
+    LEFT JOIN conciliation_results cr
+        ON cr.auditory_final_report_id = afr.id
+    INNER JOIN thirds t
+        ON t.id = ia.third_id
+    WHERE t.id = %s
+    AND eafr.ESTADO = 'contabilizada'
+    AND afr.valor_glosa > 0
+    AND cr.id IS NULL
+    """
+    
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, (third_id,))
+            rows = cursor.fetchall()
+    finally:
+        conn.close()
+    
+    return rows
+
+
+def insert_ratification_results(cfg: dict, ratification_data: list):
+    """Inserta los resultados de ratificación en conciliation_results."""
+    if not ratification_data:
+        return 0
+    
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        autocommit=False,
+        charset="utf8mb4",
+    )
+    try:
+        with conn.cursor() as cur:
+            for row in ratification_data:
+                cur.execute(
+                    """
+                    INSERT INTO conciliation_results 
+                        (id, auditory_final_report_id, invoice_audit_id, reconciliation_group_id, 
+                         response_status, autorization_number, accepted_value_eps, accepted_value_ips, 
+                         eps_ratified_value, observation, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        row['id'], row['auditory_final_report_id'], row['invoice_audit_id'],
+                        row['reconciliation_group_id'], row['response_status'], row['autorization_number'],
+                        row['accepted_value_eps'], row['accepted_value_ips'], row['eps_ratified_value'],
+                        row['observation'], row['created_at'], row['updated_at']
+                    ),
+                )
+        conn.commit()
+        return len(ratification_data)
+    finally:
+        conn.close()
+
+
+def update_ratification_status(cfg: dict, ratification_id: str, status: str):
+    """Actualiza el estado de un registro en direct_ratification."""
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        autocommit=False,
+        charset="utf8mb4",
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE direct_ratification
+                SET estado = %s
+                WHERE id = %s
+                """,
+                (status, ratification_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def convert_excel_to_pdf(excel_path: str) -> str:
+    """Convierte un archivo Excel a PDF usando LibreOffice."""
+    excel_path_obj = Path(excel_path)
+    if not excel_path_obj.exists():
+        raise FileNotFoundError(f"Archivo Excel no encontrado: {excel_path}")
+    
+    # Directorio de salida para el PDF
+    output_dir = excel_path_obj.parent
+    
+    # Intentar conversión con LibreOffice
+    try:
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--convert-to", "pdf",
+            "--outdir", str(output_dir),
+            str(excel_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        # El PDF tendrá el mismo nombre que el Excel pero con extensión .pdf
+        pdf_path = excel_path_obj.with_suffix('.pdf')
+        
+        if pdf_path.exists():
+            return str(pdf_path)
+        else:
+            raise Exception(f"LibreOffice no generó el PDF esperado. Error: {result.stderr}")
+            
+    except FileNotFoundError:
+        # LibreOffice no está instalado, intentar con soffice
+        try:
+            cmd = [
+                "soffice",
+                "--headless",
+                "--convert-to", "pdf",
+                "--outdir", str(output_dir),
+                str(excel_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
+            pdf_path = excel_path_obj.with_suffix('.pdf')
+            
+            if pdf_path.exists():
+                return str(pdf_path)
+            else:
+                raise Exception(f"soffice no generó el PDF esperado. Error: {result.stderr}")
+                
+        except Exception as e:
+            raise Exception(f"No se pudo convertir a PDF. Asegúrate de que LibreOffice esté instalado. Error: {e}")
+
+
+def generate_ratification_acta_excel(cfg: dict, third_id: str, nit: str, razon_social: str):
+    """Genera un archivo Excel de acta para la ratificación usando la plantilla."""
+    from csv_conciliation_loader import generate_acta_excels
+    import uuid
+    
+    # Obtener datos completos de auditoría para la generación del acta
+    query = """
+    SELECT
+        cr.id AS ID,
+        afr.factura_id AS FACTURA_ID,
+        afr.servicio_id AS SERVICIO_ID,
+        afr.origin AS ORIGIN,
+        t.id AS NIT,
+        t.name AS RAZON_SOCIAL,
+        afr.numero_factura AS NUMERO_FACTURA,
+        afr.fecha_inicio AS FECHA_INICIO,
+        afr.fecha_fin AS FECHA_FIN,
+        afr.modalidad AS MODALIDAD,
+        afr.regimen AS REGIMEN,
+        afr.cobertura AS COBERTURA,
+        afr.contrato AS CONTRATO,
+        afr.tipo_documento AS TIPO_DOCUMENTO,
+        afr.numero_documento AS NUMERO_DOCUMENTO,
+        afr.primer_nombre AS PRIMER_NOMBRE,
+        afr.segundo_nombre AS SEGUNDO_NOMBRE,
+        afr.primer_apellido AS PRIMER_APELLIDO,
+        afr.segundo_apellido AS SEGUNDO_APELLIDO,
+        afr.genero AS GENERO,
+        afr.codigo_servicio AS CODIGO_SERVICIO,
+        afr.descripcion_servicio AS DESCRIPCION_SERVICIO,
+        afr.cantidad_servicio AS CANTIDAD_SERVICIO,
+        afr.valor_unitario_servicio AS VALOR_UNITARIO_SERVICIO,
+        afr.valor_total_servicio AS VALOR_TOTAL_SERVICIO,
+        afr.codigos_glosa AS CODIGOS_GLOSA,
+        afr.observaciones_glosas AS OBSERVACIONES_GLOSAS,
+        afr.valor_glosa AS VALOR_GLOSA,
+        afr.valor_aprobado AS VALOR_APROBADO,
+        cr.response_status AS ESTADO_RESPUESTA,
+        cr.autorization_number AS NUMERO_DE_AUTORIZACION,
+        'ratificacion' AS RESPUESTA_DE_IPS,
+        cr.accepted_value_ips AS VALOR_ACEPTADO_POR_IPS,
+        cr.accepted_value_eps AS VALOR_ACEPTADO_POR_EPS,
+        cr.eps_ratified_value AS VALOR_RATIFICADO_EPS,
+        cr.observation AS OBSERVACIONES
+    FROM auditory_final_reports afr
+    INNER JOIN invoice_audits ia ON ia.id = afr.factura_id
+    INNER JOIN conciliation_results cr ON cr.auditory_final_report_id = afr.id
+    INNER JOIN thirds t ON t.id = ia.third_id
+    WHERE t.id = %s
+    AND cr.response_status = 'ratificacion'
+    ORDER BY afr.numero_factura
+    """
+    
+    conn = pymysql.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        user=cfg["user"],
+        password=cfg["password"],
+        database=cfg["database"],
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, (third_id,))
+            rows = cursor.fetchall()
+        
+        if not rows:
+            st.warning(f"No se encontraron datos en conciliation_results para el NIT {third_id}")
+            conn.close()
+            return None, None
+        
+        st.info(f"Se encontraron {len(rows)} registros para generar el acta")
+        
+        # Crear DataFrame con las columnas esperadas
+        df = pd.DataFrame(rows)
+        
+        # Obtener lista de IDs para generar actas
+        ids = [str(row['ID']) for row in rows]
+        
+        st.info(f"Llamando a generate_acta_excels con {len(ids)} IDs...")
+        
+        # Llamar a la función existente de generación de actas
+        generated_records = generate_acta_excels(df, ids, str(OUT_DIR), conn)
+        
+        st.info(f"generate_acta_excels retornó {len(generated_records) if generated_records else 0} registros")
+        
+        if generated_records and len(generated_records) > 0:
+            excel_path = generated_records[0].get('file_path', None)
+            
+            if excel_path:
+                # Convertir Excel a PDF
+                try:
+                    pdf_path = convert_excel_to_pdf(excel_path)
+                    
+                    # Registrar el PDF en la base de datos
+                    pdf_file_name = Path(pdf_path).name
+                    user_email = st.session_state.get("user_email", "")
+                    
+                    # Insertar registro del PDF
+                    acta_pdf_id = str(uuid.uuid4())
+                    insert_acta_pdf_record(
+                        cfg,
+                        acta_pdf_id,
+                        nit,
+                        razon_social,
+                        pdf_file_name,
+                        pdf_path,
+                        user_email,
+                        None  # nit_state_id
+                    )
+                    
+                    return excel_path, pdf_path
+                except Exception as e:
+                    # Si falla la conversión a PDF, retornar solo el Excel
+                    st.warning(f"No se pudo generar el PDF: {e}")
+                    return excel_path, None
+            
+            return excel_path, None
+        
+        return None, None
+        
+    finally:
+        conn.close()
 
 
 def parse_decimal_value(value):
@@ -1147,6 +1467,157 @@ def render_loader_page():
                     st.error(f"No se pudo generar la sábana: {exc}")
 
 
+def render_ratification_page():
+    st.title("Ratificación Directa")
+    st.caption("Consulta de registros de ratificación directa.")
+
+    try:
+        cfg, missing = get_db_config()
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    if missing:
+        st.error(
+            "Faltan variables de entorno para la conexión MySQL: "
+            + ", ".join(missing)
+        )
+        return
+
+    with st.spinner("Cargando datos de ratificación…"):
+        try:
+            df = load_ratification_dataframe(cfg)
+        except Exception as exc:
+            st.error(
+                "No se pudo obtener la información de la base de datos. "
+                f"Detalle: {exc}"
+            )
+            return
+
+    if df.empty:
+        st.info("No se encontraron registros de ratificación directa.")
+        return
+
+    # Convertir columnas a string para mejor visualización
+    df["id"] = df["id"].astype(str)
+    df["nit"] = df["nit"].astype(str)
+
+    # Filtro por NIT
+    unique_nits = sorted(df["nit"].unique())
+    selected_nits = st.multiselect(
+        "Filtrar por NIT",
+        options=unique_nits,
+        default=[],
+    )
+
+    filtered = df[df["nit"].isin(selected_nits)] if selected_nits else df
+
+    # Agregar columna de acciones solo para estados no completados
+    df_view = filtered.copy()
+    df_view["Generar"] = df_view["estado"].apply(lambda x: False if str(x).lower() == "completado" else False)
+
+    # Configurar etiquetas amigables para columnas
+    pretty_labels = {
+        col: st.column_config.Column(col.replace("_", " "))
+        for col in df_view.columns
+        if col not in ["Generar"]
+    }
+
+    # Mostrar tabla con botón de acción
+    editor_result = st.data_editor(
+        df_view,
+        width='stretch',
+        hide_index=True,
+        disabled=[col for col in df_view.columns if col not in ["Generar"]],
+        column_config={
+            "Generar": st.column_config.CheckboxColumn(
+                "Generar Ratificación",
+                help="Generar ratificación para este registro",
+                default=False,
+            ),
+            **pretty_labels,
+        },
+        key="ratification_table_editor",
+    )
+
+    # Procesar filas seleccionadas para generar ratificación
+    clicked_rows = editor_result[editor_result["Generar"] == True]
+    if not clicked_rows.empty:
+        total_selected = len(clicked_rows)
+        st.info(f"📋 Procesando {total_selected} registro(s) seleccionado(s)...")
+        
+        success_count = 0
+        error_count = 0
+        
+        # Crear un contenedor para el progreso
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for idx, (row_idx, row) in enumerate(clicked_rows.iterrows(), 1):
+            ratification_id = str(row.get("id", ""))
+            nit = str(row.get("nit", ""))
+            razon_social = str(row.get("razon_social", ""))
+            estado_actual = str(row.get("estado", "")).lower()
+            
+            # Actualizar progreso
+            progress_bar.progress(idx / total_selected)
+            status_text.text(f"Procesando {idx}/{total_selected}: {razon_social} (NIT: {nit})")
+            
+            if estado_actual == "completado":
+                st.warning(f"⚠️ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Ya está completado, omitiendo.")
+                error_count += 1
+                continue
+            
+            try:
+                # 1. Obtener datos de ratificación (nit es el mismo que third_id)
+                ratification_data = get_ratification_data(cfg, nit)
+                
+                if not ratification_data:
+                    st.warning(f"⚠️ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - No se encontraron registros para ratificar.")
+                    error_count += 1
+                else:
+                    # 2. Insertar resultados en conciliation_results
+                    count = insert_ratification_results(cfg, ratification_data)
+                    
+                    # 3. Generar archivo Excel y PDF de acta (nit es el mismo que third_id)
+                    excel_path, pdf_path = generate_ratification_acta_excel(cfg, nit, nit, razon_social)
+                    
+                    if not excel_path:
+                        st.error(f"❌ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Error al generar Excel.")
+                        error_count += 1
+                    else:
+                        # 4. Actualizar estado a "completado"
+                        update_ratification_status(cfg, ratification_id, "completado")
+                        
+                        st.success(f"✅ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - {count} registros procesados")
+                        success_count += 1
+                        
+            except Exception as exc:
+                st.error(f"❌ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Error: {exc}")
+                error_count += 1
+        
+        # Limpiar progreso
+        progress_bar.empty()
+        status_text.empty()
+        
+        # Mostrar resumen final
+        st.success(f"🎉 Proceso completado: {success_count} exitosos, {error_count} con errores")
+        
+        # Limpiar cache y recargar
+        load_ratification_dataframe.clear()
+        
+        time.sleep(2)
+        rerun_app()
+
+    # Botón de descarga
+    st.download_button(
+        "Descargar CSV",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="ratificacion_directa.csv",
+        mime="text/csv",
+    )
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -1155,7 +1626,7 @@ def main():
     ensure_dirs()
 
     default_menu = st.session_state.get("menu_option", "Cargar CSV")
-    menu_options = ["Cargar CSV", "Resumen"]
+    menu_options = ["Cargar CSV", "Resumen", "Ratificacion"]
 
     show_detail_option = bool(st.session_state.get("selected_nit"))
     if show_detail_option:
@@ -1178,6 +1649,8 @@ def main():
         render_summary_page()
     elif menu_option == "Detalle NIT":
         render_nit_detail_page()
+    elif menu_option == "Ratificacion":
+        render_ratification_page()
     else:
         render_loader_page()
 

@@ -6,7 +6,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     TZ=America/Bogota
 
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
+    libreoffice \
+    libreoffice-calc \
   && rm -rf /var/lib/apt/lists/*
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 

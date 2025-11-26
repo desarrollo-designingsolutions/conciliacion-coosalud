@@ -184,8 +184,11 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
         error(f"Plantilla de acta no encontrada: {template_path}")
         return []
 
-    currency_format = '[$-es-CO]"$" #.##0'
-    fallback_currency_format = '[$-en-US]"$" #,##0'
+    # Formato de moneda colombiana: $ con separador de miles (punto) y sin decimales
+    # Formato con locale español-Colombia para que use punto como separador de miles
+    currency_format = '[$-240A]"$"* #,##0;-[$-240A]"$"* #,##0'
+    # Formato alternativo simple
+    fallback_currency_format = '"$" #,##0_);[Red]("$" #,##0)'
 
     acta_dir = Path(out_dir) / ACTA_OUTPUT_DIRNAME
     try:
@@ -230,11 +233,44 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
     def get_db_name() -> str:
         if conn is None:
             return ""
-        db_name = getattr(conn, "db", "") or ""
-        if isinstance(db_name, bytes):
-            db_name = db_name.decode("utf-8", errors="ignore")
+        # Intentar obtener el nombre de la base de datos
+        db_name = ""
+        
+        # Método 1: Atributo db (bytes)
+        try:
+            db_attr = getattr(conn, "db", None)
+            if db_attr:
+                if isinstance(db_attr, bytes):
+                    db_name = db_attr.decode("utf-8", errors="ignore")
+                else:
+                    db_name = str(db_attr)
+        except Exception:
+            pass
+        
+        # Método 2: Atributo database (string)
+        if not db_name:
+            try:
+                db_attr = getattr(conn, "database", None)
+                if db_attr:
+                    db_name = str(db_attr)
+            except Exception:
+                pass
+        
+        # Método 3: Consulta SQL SELECT DATABASE()
+        if not db_name:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT DATABASE()")
+                    result = cur.fetchone()
+                    if result and result[0]:
+                        db_name = str(result[0])
+            except Exception:
+                pass
+        
+        # Método 4: Variable de entorno
         if not db_name:
             db_name = os.getenv("MYSQL_DB", "")
+        
         return db_name
 
     def get_table_columns(table: str) -> set[str]:
@@ -245,6 +281,7 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
             return column_cache[table_key]
         db_name = get_db_name()
         if not db_name:
+            error(f"No se pudo obtener el nombre de la base de datos para consultar columnas de {table}")
             column_cache[table_key] = set()
             return set()
         try:
@@ -258,10 +295,12 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
                     (db_name, table),
                 )
                 cols = {row[0].lower() for row in cur.fetchall()}
+                if not cols:
+                    error(f"La tabla {table} no existe en la base de datos {db_name} o no tiene columnas")
                 column_cache[table_key] = cols
                 return cols
         except Exception as exc:
-            error(f"No se pudieron obtener las columnas de {table}: {exc}")
+            error(f"No se pudieron obtener las columnas de {table} (DB: {db_name}): {exc}")
             column_cache[table_key] = set()
             return set()
 
@@ -271,58 +310,74 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
             return location_cache[key]
         departamento = ""
         municipio = ""
+        
         if conn is not None and key:
             try:
                 with conn.cursor() as cur:
                     row = None
-                    td_columns = get_table_columns("third_departments")
-                    if "nit" in td_columns:
+                    
+                    # Estrategia 1: Buscar directamente por third_id
+                    try:
                         cur.execute(
                             """
                             SELECT departamento, municipio
                             FROM third_departments
-                            WHERE nit = %s
+                            WHERE third_id = %s
                             ORDER BY updated_at DESC, id DESC
                             LIMIT 1
                             """,
                             (key,),
                         )
                         row = cur.fetchone()
-
-                    if row is None and "third_id" in td_columns:
-                        third_columns = get_table_columns("thirds")
-                        conditions: list[str] = []
-                        params: list[str] = []
-                        candidate_map = [
-                            ("nit", "t.nit = %s"),
-                            ("identification", "t.identification = %s"),
-                            ("numero_identificacion", "t.numero_identificacion = %s"),
-                            ("documento", "t.documento = %s"),
-                            ("document_number", "t.document_number = %s"),
-                        ]
-                        for col_name, expr in candidate_map:
-                            if col_name in third_columns:
-                                conditions.append(expr)
-                                params.append(key)
-
-                        if conditions:
-                            where_clause = " OR ".join(conditions)
-                            query = f"""
-SELECT td.departamento, td.municipio
-FROM third_departments td
-INNER JOIN thirds t ON t.id = td.third_id
-WHERE {where_clause}
-ORDER BY td.updated_at DESC, td.id DESC
-LIMIT 1
-"""
-                            cur.execute(query, tuple(params))
+                    except Exception:
+                        pass
+                    
+                    # Estrategia 2: Buscar por nit en third_departments (si la columna existe)
+                    if row is None:
+                        try:
+                            cur.execute(
+                                """
+                                SELECT departamento, municipio
+                                FROM third_departments
+                                WHERE nit = %s
+                                ORDER BY updated_at DESC, id DESC
+                                LIMIT 1
+                                """,
+                                (key,),
+                            )
                             row = cur.fetchone()
+                        except Exception:
+                            pass
+
+                    # Estrategia 3: JOIN con thirds buscando por múltiples campos
+                    if row is None:
+                        try:
+                            cur.execute(
+                                """
+                                SELECT td.departamento, td.municipio
+                                FROM third_departments td
+                                INNER JOIN thirds t ON t.id = td.third_id
+                                WHERE t.id = %s OR t.nit = %s
+                                ORDER BY td.updated_at DESC, td.id DESC
+                                LIMIT 1
+                                """,
+                                (key, key),
+                            )
+                            row = cur.fetchone()
+                        except Exception:
+                            pass
 
                     if row:
-                        departamento = (row[0] or "").strip()
-                        municipio = (row[1] or "").strip()
+                        # El cursor puede retornar tupla o diccionario dependiendo de la configuración
+                        if isinstance(row, dict):
+                            departamento = (row.get('departamento') or "").strip()
+                            municipio = (row.get('municipio') or "").strip()
+                        else:
+                            departamento = (row[0] or "").strip()
+                            municipio = (row[1] or "").strip()
             except Exception as exc:
                 error(f"No se pudo obtener departamento/municipio para el NIT {key}: {exc}")
+        
         location_cache[key] = (departamento, municipio)
         return location_cache[key]
 
@@ -368,6 +423,17 @@ LIMIT 1
             wb = load_workbook(template_path)
             ws = wb.active
 
+            # Limpiar celdas con #VALUE! o fórmulas IMAGE que causan errores
+            for row in ws.iter_rows(min_row=1, max_row=35):
+                for cell in row:
+                    if cell.value:
+                        cell_str = str(cell.value)
+                        # Eliminar #VALUE! o fórmulas IMAGE
+                        if '#VALUE!' in cell_str or '#¡VALOR!' in cell_str:
+                            cell.value = None
+                        elif cell_str.startswith('=') and ('IMAGE' in cell_str.upper() or 'IMAGEN' in cell_str.upper()):
+                            cell.value = None
+
             for col_idx in range(1, 14):
                 header_cell = ws.cell(row=7, column=col_idx)
                 try:
@@ -388,7 +454,23 @@ LIMIT 1
 
             additional_rows = max(row_count - 1, 0)
             if additional_rows:
+                # Insertar filas sin manipular las imágenes (evita error de openpyxl)
                 ws.insert_rows(9, amount=additional_rows)
+                
+                # Deshacer celdas combinadas que puedan interferir con el diseño
+                # Esto evita que las celdas se combinen incorrectamente después de insertar filas
+                merged_ranges_to_remove = []
+                for merged_range in ws.merged_cells.ranges:
+                    # Si la celda combinada está en el área afectada por la inserción de filas
+                    # (después de la fila 9), la marcamos para eliminar
+                    if merged_range.min_row >= 9:
+                        merged_ranges_to_remove.append(str(merged_range))
+                
+                for merged_range in merged_ranges_to_remove:
+                    try:
+                        ws.unmerge_cells(merged_range)
+                    except Exception:
+                        pass
 
             template_cells = tuple(ws[8])
             for offset in range(row_count):
@@ -488,9 +570,9 @@ LIMIT 1
             )
             ws[f"A{footer_row}"] = footer_text
 
-            timestamp = current_dt.strftime("%Y%m%d_%H%M%S")
             safe_nit = ''.join(ch for ch in str(nit) if ch.isalnum()) or "sin_nit"
-            out_path = acta_dir / f"acta_conciliacion_{safe_nit}_{timestamp}.xlsx"
+            out_path = acta_dir / f"GF-F-16 ACTA DE CONCILIACION {safe_nit}.xlsx"
+            
             try:
                 wb.save(out_path)
             except TypeError as exc:
