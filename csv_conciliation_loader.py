@@ -493,6 +493,10 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
             pair_rows = pair_rows.reset_index(drop=True)
             for idx_row, record in pair_rows.iterrows():
                 excel_row = data_start_row + idx_row
+                
+                # Establecer altura fija de 30 puntos para la fila de datos
+                ws.row_dimensions[excel_row].height = 30
+                
                 numero_factura = str(record.get("NUMERO_FACTURA", "")).strip()
                 codigo_glosa = str(record.get("CODIGOS_GLOSA", "")).strip()
                 contrato = str(record.get("CONTRATO", "")).strip()
@@ -561,7 +565,21 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
                 target_cell.value = f"={source_col}{results_row}"
                 apply_currency(target_cell)
 
+            # Establecer altura fija para la fila de totales (fila 9 en plantilla)
+            ws.row_dimensions[results_row].height = 30
+            
+            # Establecer altura fija de 20 puntos para las filas del footer de resumen (filas 11-17 en plantilla)
+            # En la plantilla: results_row=9, footer resumen va de fila 11 a 17
+            # Eso es results_row+2 hasta results_row+8
+            for row_offset in range(2, 9):  # De +2 a +8 (filas 11 a 17 en plantilla)
+                summary_row = results_row + row_offset
+                ws.row_dimensions[summary_row].height = 20
+
             footer_row = 19 + row_shift
+            
+            # Establecer altura fija de 80 puntos para las filas 19 y 20 (footer_row y footer_row+1)
+            ws.row_dimensions[footer_row].height = 60
+            ws.row_dimensions[footer_row + 1].height = 60
             month_name = month_names.get(current_dt.month, "")
             footer_text = (
                 "La presente acta se expide en la ciudad de CARTAGENA, el día "
@@ -569,6 +587,76 @@ def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -
                 "y se suscribe por los funcionarios representates de las entidades que participan en el proceso de conciliación."
             )
             ws[f"A{footer_row}"] = footer_text
+
+            # Agregar imágenes de firmas basadas en la posición de la fila de totales (results_row)
+            # En la plantilla: totales en fila 9, firma 1 en H22 (+13), firma 2 en H28 (+19)
+            # Las firmas se colocan relativamente a results_row para ajustarse dinámicamente
+            template_images = []
+            if hasattr(ws, '_images') and ws._images:
+                from openpyxl.drawing.image import Image as XLImage
+                import io
+                
+                # Copiar las imágenes de la plantilla
+                for img in ws._images:
+                    try:
+                        # Copiar los datos binarios de la imagen
+                        if hasattr(img, 'ref'):
+                            img.ref.seek(0)
+                            img_bytes = img.ref.read()
+                            
+                            if img_bytes:
+                                template_images.append({
+                                    'bytes': img_bytes,
+                                    'original_row': img.anchor._from.row if hasattr(img, 'anchor') and hasattr(img.anchor, '_from') else 0,
+                                    'col': img.anchor._from.col if hasattr(img, 'anchor') and hasattr(img.anchor, '_from') else 7,  # Default columna H
+                                })
+                    except Exception as e:
+                        error(f"Error al copiar imagen: {e}")
+                
+                # Limpiar imágenes originales
+                ws._images = []
+                
+                # Ordenar imágenes por su posición original (de arriba a abajo)
+                template_images.sort(key=lambda x: x['original_row'])
+                
+                # Re-agregar imágenes en posiciones relativas a la fila de totales (results_row)
+                # Hay 3 imágenes ordenadas por posición: idx=0 (logo), idx=1 (firma1), idx=2 (firma2)
+                for idx, img_data in enumerate(template_images):
+                    try:
+                        img_stream = io.BytesIO(img_data['bytes'])
+                        new_img = XLImage(img_stream)
+                        
+                        # Posicionar imágenes
+                        if idx == 0:
+                            # Logo: mantener en su posición original + 2 filas
+                            new_row = img_data['original_row'] + 2
+                            # Mover logo un poco a la derecha (1 columna)
+                            col_letter = chr(65 + img_data['col'] + 1)
+                        elif idx == 1:
+                            # Firma 1: posición relativa a results_row
+                            # En plantilla: results_row=9, firma1=22 (offset +13)
+                            # Con 206 registros: results_row=214, firma1=227
+                            new_row = results_row + 11
+                            col_letter = chr(65 + img_data['col'])
+                        elif idx == 2:
+                            # Firma 2: posición relativa a results_row
+                            # En plantilla: results_row=9, firma2=28 (offset +19)
+                            # Con 206 registros: results_row=214, firma2=233
+                            new_row = results_row + 19
+                            # Reducir tamaño de la firma 2 al 50%
+                            new_img.width = int(new_img.width * 0.5)
+                            new_img.height = int(new_img.height * 0.5)
+                            col_letter = chr(65 + img_data['col'])
+                        else:
+                            # Otras imágenes: mantener posición original
+                            new_row = img_data['original_row']
+                            col_letter = chr(65 + img_data['col'])
+                        
+                        new_img.anchor = f"{col_letter}{new_row}"
+                        
+                        ws.add_image(new_img)
+                    except Exception as e:
+                        error(f"Error al agregar imagen: {e}")
 
             safe_nit = ''.join(ch for ch in str(nit) if ch.isalnum()) or "sin_nit"
             out_path = acta_dir / f"GF-F-16 ACTA DE CONCILIACION {safe_nit}.xlsx"
