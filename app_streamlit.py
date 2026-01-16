@@ -310,7 +310,7 @@ def get_ratification_data(cfg: dict, third_id: str):
         0 AS accepted_value_eps,
         0 AS accepted_value_ips,
         afr.valor_glosa AS eps_ratified_value,
-        'Se mantiene la glosa formulada por cuanto el prestador de servicios de salud a pesar de las notificaciones realizadas no presenta animo conciliatorio, como se evidencia en los soportes adjuntos' AS observation,
+        'Se mantiene la glosa formulada por cuanto no fue posible contactar al prestador de servicios de salud' AS observation,
         NOW() AS created_at,
         NOW() AS updated_at
     FROM auditory_final_reports afr
@@ -1523,7 +1523,7 @@ def render_ratification_page():
         if col not in ["Generar"]
     }
 
-    # Mostrar tabla con botón de acción
+    # Mostrar tabla con checkboxes de selección
     editor_result = st.data_editor(
         df_view,
         width='stretch',
@@ -1531,8 +1531,8 @@ def render_ratification_page():
         disabled=[col for col in df_view.columns if col not in ["Generar"]],
         column_config={
             "Generar": st.column_config.CheckboxColumn(
-                "Generar Ratificación",
-                help="Generar ratificación para este registro",
+                "Seleccionar",
+                help="Seleccionar este registro para procesamiento",
                 default=False,
             ),
             **pretty_labels,
@@ -1540,75 +1540,16 @@ def render_ratification_page():
         key="ratification_table_editor",
     )
 
-    # Procesar filas seleccionadas para generar ratificación
-    clicked_rows = editor_result[editor_result["Generar"] == True]
-    if not clicked_rows.empty:
-        total_selected = len(clicked_rows)
-        st.info(f"📋 Procesando {total_selected} registro(s) seleccionado(s)...")
+    # Contar filas seleccionadas
+    selected_rows = editor_result[editor_result["Generar"] == True]
+    
+    if not selected_rows.empty:
+        st.info(f"✅ {len(selected_rows)} registro(s) seleccionado(s)")
         
-        success_count = 0
-        error_count = 0
-        
-        # Crear un contenedor para el progreso
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for idx, (row_idx, row) in enumerate(clicked_rows.iterrows(), 1):
-            ratification_id = str(row.get("id", ""))
-            nit = str(row.get("nit", ""))
-            razon_social = str(row.get("razon_social", ""))
-            estado_actual = str(row.get("estado", "")).lower()
-            
-            # Actualizar progreso
-            progress_bar.progress(idx / total_selected)
-            status_text.text(f"Procesando {idx}/{total_selected}: {razon_social} (NIT: {nit})")
-            
-            if estado_actual == "completado":
-                st.warning(f"⚠️ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Ya está completado, omitiendo.")
-                error_count += 1
-                continue
-            
-            try:
-                # 1. Obtener datos de ratificación (nit es el mismo que third_id)
-                ratification_data = get_ratification_data(cfg, nit)
-                
-                if not ratification_data:
-                    st.warning(f"⚠️ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - No se encontraron registros para ratificar.")
-                    error_count += 1
-                else:
-                    # 2. Insertar resultados en conciliation_results
-                    count = insert_ratification_results(cfg, ratification_data)
-                    
-                    # 3. Generar archivo Excel y PDF de acta (nit es el mismo que third_id)
-                    excel_path, pdf_path = generate_ratification_acta_excel(cfg, nit, nit, razon_social)
-                    
-                    if not excel_path:
-                        st.error(f"❌ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Error al generar Excel.")
-                        error_count += 1
-                    else:
-                        # 4. Actualizar estado a "completado"
-                        update_ratification_status(cfg, ratification_id, "completado")
-                        
-                        st.success(f"✅ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - {count} registros procesados")
-                        success_count += 1
-                        
-            except Exception as exc:
-                st.error(f"❌ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Error: {exc}")
-                error_count += 1
-        
-        # Limpiar progreso
-        progress_bar.empty()
-        status_text.empty()
-        
-        # Mostrar resumen final
-        st.success(f"🎉 Proceso completado: {success_count} exitosos, {error_count} con errores")
-        
-        # Limpiar cache y recargar
-        load_ratification_dataframe.clear()
-        
-        time.sleep(2)
-        rerun_app()
-
+        # Botón para iniciar el procesamiento
+        if st.button("🚀 Procesar Registros Seleccionados", type="primary", use_container_width=True):
+            process_selected_ratifications(cfg, selected_rows)
+    
     # Botón de descarga
     st.download_button(
         "Descargar CSV",
@@ -1616,6 +1557,78 @@ def render_ratification_page():
         file_name="ratificacion_directa.csv",
         mime="text/csv",
     )
+
+
+def process_selected_ratifications(cfg: dict, clicked_rows):
+    """Procesa las ratificaciones seleccionadas."""
+    if clicked_rows.empty:
+        return
+        
+    total_selected = len(clicked_rows)
+    st.info(f"📋 Procesando {total_selected} registro(s) seleccionado(s)...")
+    
+    success_count = 0
+    error_count = 0
+    
+    # Crear un contenedor para el progreso
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, (row_idx, row) in enumerate(clicked_rows.iterrows(), 1):
+        ratification_id = str(row.get("id", ""))
+        nit = str(row.get("nit", ""))
+        razon_social = str(row.get("razon_social", ""))
+        estado_actual = str(row.get("estado", "")).lower()
+        
+        # Actualizar progreso
+        progress_bar.progress(idx / total_selected)
+        status_text.text(f"Procesando {idx}/{total_selected}: {razon_social} (NIT: {nit})")
+        
+        if estado_actual == "completado":
+            st.warning(f"⚠️ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Ya está completado, omitiendo.")
+            error_count += 1
+            continue
+        
+        try:
+            # 1. Obtener datos de ratificación (nit es el mismo que third_id)
+            ratification_data = get_ratification_data(cfg, nit)
+            
+            if not ratification_data:
+                st.warning(f"⚠️ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - No se encontraron registros para ratificar.")
+                error_count += 1
+            else:
+                # 2. Insertar resultados en conciliation_results
+                count = insert_ratification_results(cfg, ratification_data)
+                
+                # 3. Generar archivo Excel y PDF de acta (nit es el mismo que third_id)
+                excel_path, pdf_path = generate_ratification_acta_excel(cfg, nit, nit, razon_social)
+                
+                if not excel_path:
+                    st.error(f"❌ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Error al generar Excel.")
+                    error_count += 1
+                else:
+                    # 4. Actualizar estado a "completado"
+                    update_ratification_status(cfg, ratification_id, "completado")
+                    
+                    st.success(f"✅ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - {count} registros procesados")
+                    success_count += 1
+                    
+        except Exception as exc:
+            st.error(f"❌ [{idx}/{total_selected}] {razon_social} (NIT: {nit}) - Error: {exc}")
+            error_count += 1
+    
+    # Limpiar progreso
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Mostrar resumen final
+    st.success(f"🎉 Proceso completado: {success_count} exitosos, {error_count} con errores")
+    
+    # Limpiar cache y recargar
+    load_ratification_dataframe.clear()
+    
+    time.sleep(2)
+    rerun_app()
 
 
 def main():
