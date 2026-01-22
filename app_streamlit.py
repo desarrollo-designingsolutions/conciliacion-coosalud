@@ -844,6 +844,713 @@ def file_to_download_button(label: str, path: Path, color: str = "neutral"):
     st.markdown(btn_html, unsafe_allow_html=True)
 
 
+def render_reports_page():
+    st.title("Reportes de Auditoría")
+    st.caption("Busca por NIT y/o factura, aplica filtros y descarga el reporte completo.")
+
+    try:
+        cfg, missing = get_db_config()
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    if missing:
+        st.error(
+            "Faltan variables de entorno para la conexión MySQL: "
+            + ", ".join(missing)
+        )
+        return
+
+    st.header("📦 Generación masiva de reportes por NIT")
+    st.caption("Selecciona múltiples NITs para generar archivos CSV individuales")
+    
+    with st.spinner("Cargando lista de NITs..."):
+        try:
+            conn = pymysql.connect(
+                host=cfg["host"],
+                port=cfg["port"],
+                user=cfg["user"],
+                password=cfg["password"],
+                database=cfg["database"],
+                cursorclass=pymysql.cursors.DictCursor,
+            )
+            
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT DISTINCT t.id, t.name 
+                        FROM thirds t
+                        INNER JOIN invoice_audits ia ON ia.third_id = t.id
+                        INNER JOIN auditory_final_reports afr ON afr.factura_id = ia.id
+                        ORDER BY t.id
+                    """)
+                    nit_rows = cursor.fetchall()
+            finally:
+                conn.close()
+            
+            if nit_rows:
+                nit_options = {f"{row['id']} - {row['name']}": row['id'] for row in nit_rows}
+                
+                col_select1, col_select2 = st.columns([3, 1])
+                with col_select1:
+                    selected_nit_labels = st.multiselect(
+                        "Selecciona los NITs para generar reportes",
+                        options=list(nit_options.keys()),
+                        default=st.session_state.get("selected_all_nits", []),
+                        help=f"Total de NITs disponibles: {len(nit_options)}"
+                    )
+                with col_select2:
+                    st.write("")
+                    st.write("")
+                    if st.button("✅ Seleccionar todos", use_container_width=True):
+                        st.session_state["selected_all_nits"] = list(nit_options.keys())
+                        rerun_app()
+                
+                selected_nits = [nit_options[label] for label in selected_nit_labels]
+                
+                if st.session_state.get("selected_all_nits") and not selected_nit_labels:
+                    st.session_state.pop("selected_all_nits", None)
+                
+                report_type = st.radio(
+                    "Tipo de reporte a generar",
+                    options=["Agrupado por factura", "Detallado (Ver todo)"],
+                    horizontal=True,
+                    help="Agrupado: Totales por factura | Detallado: Registro línea por línea con todos los servicios"
+                )
+                
+                estado_filter = st.multiselect(
+                    "Filtrar por estados",
+                    options=["contabilizada", "devolución", "eliminada"],
+                    default=["contabilizada", "devolución", "eliminada"],
+                    help="Selecciona los estados que deseas incluir en el reporte. Si no seleccionas ninguno, se incluirán todos los registros."
+                )
+                
+                if selected_nits:
+                    st.info(f"📊 NITs seleccionados: **{len(selected_nits)}** | Tipo: **{report_type}**")
+                    
+                    col_gen1, col_gen2 = st.columns([1, 3])
+                    with col_gen1:
+                        if st.button("🚀 Generar reportes", type="primary", use_container_width=True):
+                            st.session_state["batch_generation_nits"] = selected_nits
+                            st.session_state["batch_generation_report_type"] = report_type
+                            st.session_state["batch_generation_estado_filter"] = estado_filter
+                            st.session_state["batch_generation_status"] = {}
+                            st.session_state["batch_generation_running"] = True
+                            rerun_app()
+                    
+                    with col_gen2:
+                        if st.button("🗑️ Limpiar selección"):
+                            st.session_state.pop("batch_generation_nits", None)
+                            st.session_state.pop("batch_generation_report_type", None)
+                            st.session_state.pop("batch_generation_estado_filter", None)
+                            st.session_state.pop("batch_generation_status", None)
+                            st.session_state.pop("batch_generation_running", None)
+                            st.session_state.pop("selected_all_nits", None)
+                            rerun_app()
+                    
+                    if st.session_state.get("batch_generation_running"):
+                        batch_nits = st.session_state.get("batch_generation_nits", [])
+                        batch_report_type = st.session_state.get("batch_generation_report_type", "Agrupado por factura")
+                        batch_estado_filter = st.session_state.get("batch_generation_estado_filter", [])
+                        batch_status = st.session_state.get("batch_generation_status", {})
+                        
+                        reports_dir = OUT_DIR / "reportes_masivos"
+                        reports_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        progress_placeholder = st.empty()
+                        progress_bar = st.progress(0)
+                        status_table_placeholder = st.empty()
+                        
+                        total_nits = len(batch_nits)
+                        is_agrupado = batch_report_type == "Agrupado por factura"
+                        
+                        for idx, nit in enumerate(batch_nits):
+                            if nit in batch_status and batch_status[nit]["status"] == "completado":
+                                continue
+                            
+                            current_count = idx + 1
+                            progress_percentage = int((current_count / total_nits) * 100)
+                            progress_placeholder.info(f"🔄 Procesando {current_count}/{total_nits} NITs | **{nit}** | {progress_percentage}% completado")
+                            progress_bar.progress(current_count / total_nits)
+                            
+                            batch_status[nit] = {
+                                "status": "procesando",
+                                "archivo": None,
+                                "error": None
+                            }
+                            
+                            status_table_placeholder.dataframe(
+                                pd.DataFrame([{
+                                    "NIT": k,
+                                    "Estado": v["status"],
+                                    "Archivo": Path(v.get("archivo", "")).name if v.get("archivo") else ""
+                                } for k, v in batch_status.items()]),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+                            
+                            try:
+                                conn = pymysql.connect(
+                                    host=cfg["host"],
+                                    port=cfg["port"],
+                                    user=cfg["user"],
+                                    password=cfg["password"],
+                                    database=cfg["database"],
+                                    cursorclass=pymysql.cursors.DictCursor,
+                                )
+                                
+                                try:
+                                    with conn.cursor() as cursor:
+                                        if is_agrupado:
+                                            query_agrupado = """
+                                        SELECT
+                                            aud.factura_id,
+                                            aud.origin,
+                                            aud.nit,
+                                            aud.razon_social,
+                                            aud.numero_factura,
+                                            aud.fecha_inicio,
+                                            aud.fecha_fin,
+                                            aud.modalidad,
+                                            aud.regimen,
+                                            aud.cobertura,
+                                            aud.contrato,
+                                            SUM(aud.valor_total_servicio) AS valor_total_servicios,
+                                            GROUP_CONCAT(DISTINCT aud.codigos_glosa ORDER BY aud.codigos_glosa SEPARATOR '-') AS codigos_glosa,
+                                            SUM(aud.valor_glosa) AS valor_glosa,
+                                            SUM(aud.valor_aprobado) AS valor_aprobado,
+                                            GROUP_CONCAT(DISTINCT eafr.ESTADO ORDER BY eafr.ESTADO SEPARATOR '-') AS estado,
+                                            SUM(ci.accepted_value_eps) AS valor_aceptado_eps,
+                                            SUM(ci.accepted_value_ips) AS valor_aceptado_ips,
+                                            SUM(ci.eps_ratified_value) AS valor_ratificado,
+                                            MAX(ci.observation) AS observacion_conciliacion,
+                                            MAX(ci.created_at) AS fecha_creacion,
+                                            CASE
+                                                WHEN MAX(eafr.ESTADO = 'contabilizada') = 1 AND SUM(aud.valor_glosa) > 0 THEN
+                                                    CASE
+                                                        WHEN COUNT(ci.id) > 0 THEN 'CONCILIADO'
+                                                        ELSE 'NO CONCILIADA'
+                                                    END
+                                                ELSE 'NO REQUIERE CONCILIACION'
+                                            END AS estado_conciliacion
+                                        FROM auditory_final_reports aud
+                                        INNER JOIN estados_auditory_final_reports eafr
+                                            ON eafr.ID = aud.id
+                                        INNER JOIN invoice_audits ia
+                                            ON ia.id = aud.factura_id
+                                        INNER JOIN thirds t
+                                            ON t.id = ia.third_id
+                                        LEFT JOIN conciliation_results ci
+                                            ON ci.auditory_final_report_id = aud.id
+                                        WHERE t.id = %s
+                                        """
+                                            
+                                            if batch_estado_filter:
+                                                placeholders = ','.join(['%s'] * len(batch_estado_filter))
+                                                query_agrupado += f" AND eafr.ESTADO IN ({placeholders})"
+                                            
+                                            query_agrupado += """
+                                        GROUP BY
+                                            aud.factura_id,
+                                            aud.origin,
+                                            aud.nit,
+                                            aud.razon_social,
+                                            aud.numero_factura,
+                                            aud.fecha_inicio,
+                                            aud.fecha_fin,
+                                            aud.modalidad,
+                                            aud.regimen,
+                                            aud.cobertura,
+                                            aud.contrato
+                                        ORDER BY aud.id DESC
+                                        """
+                                            
+                                            query_params = [nit] + batch_estado_filter if batch_estado_filter else [nit]
+                                            cursor.execute(query_agrupado, query_params)
+                                            rows = cursor.fetchall()
+                                        else:
+                                            query_detallado = """
+                                        SELECT
+                                            aud.id,
+                                            aud.factura_id,
+                                            aud.servicio_id,
+                                            aud.origin,
+                                            aud.nit,
+                                            aud.razon_social,
+                                            aud.numero_factura,
+                                            aud.fecha_inicio,
+                                            aud.fecha_fin,
+                                            aud.modalidad,
+                                            aud.regimen,
+                                            aud.cobertura,
+                                            aud.contrato,
+                                            aud.tipo_documento,
+                                            aud.numero_documento,
+                                            aud.primer_nombre,
+                                            aud.segundo_nombre,
+                                            aud.primer_apellido,
+                                            aud.segundo_apellido,
+                                            aud.genero,
+                                            aud.codigo_servicio,
+                                            aud.descripcion_servicio,
+                                            aud.cantidad_servicio,
+                                            aud.valor_unitario_servicio,
+                                            aud.valor_total_servicio,
+                                            aud.codigos_glosa,
+                                            aud.observaciones_glosas,
+                                            aud.valor_glosa,
+                                            aud.valor_aprobado,
+                                            eafr.ESTADO AS estado,
+                                            ci.accepted_value_eps AS valor_aceptado_eps,
+                                            ci.accepted_value_ips AS valor_aceptado_ips,
+                                            ci.eps_ratified_value AS valor_ratificado,
+                                            ci.observation AS observacion_conciliacion,
+                                            ci.created_at AS fecha_creacion,
+                                            CASE
+                                                WHEN eafr.ESTADO = 'contabilizada' AND aud.valor_glosa > 0 THEN
+                                                    CASE
+                                                        WHEN ci.id IS NOT NULL THEN 'CONCILIADO'
+                                                        ELSE 'NO CONCILIADA'
+                                                    END
+                                                ELSE 'NO REQUIERE CONCILIACION'
+                                            END AS estado_conciliacion
+                                        FROM auditory_final_reports aud
+                                        INNER JOIN estados_auditory_final_reports eafr
+                                            ON eafr.ID = aud.id
+                                        INNER JOIN invoice_audits ia
+                                            ON ia.id = aud.factura_id
+                                        INNER JOIN thirds t
+                                            ON t.id = ia.third_id
+                                        LEFT JOIN conciliation_results ci
+                                            ON ci.auditory_final_report_id = aud.id
+                                        WHERE t.id = %s
+                                        """
+                                            
+                                            if batch_estado_filter:
+                                                placeholders = ','.join(['%s'] * len(batch_estado_filter))
+                                                query_detallado += f" AND eafr.ESTADO IN ({placeholders})"
+                                            
+                                            query_detallado += " ORDER BY aud.id DESC"
+                                            
+                                            query_params = [nit] + batch_estado_filter if batch_estado_filter else [nit]
+                                            cursor.execute(query_detallado, query_params)
+                                            rows = cursor.fetchall()
+                                finally:
+                                    conn.close()
+                                
+                                safe_nit = "".join(ch for ch in str(nit) if ch.isalnum())
+                                filename_suffix = "agrupado" if is_agrupado else "detalle"
+                                filename = f"{safe_nit}_{filename_suffix}.csv"
+                                filepath = reports_dir / filename
+                                
+                                if rows:
+                                    df = pd.DataFrame(rows)
+                                    df.to_csv(filepath, index=False, sep=";", encoding="utf-8")
+                                    batch_status[nit]["archivo"] = str(filepath)
+                                    batch_status[nit]["status"] = "completado"
+                                else:
+                                    batch_status[nit]["status"] = "sin datos"
+                                    batch_status[nit]["error"] = "No se encontraron registros para este NIT"
+                                
+                            except Exception as e:
+                                batch_status[nit]["status"] = "error"
+                                batch_status[nit]["error"] = str(e)
+                            
+                            st.session_state["batch_generation_status"] = batch_status
+                            
+                            status_table_placeholder.dataframe(
+                                pd.DataFrame([{
+                                    "NIT": k,
+                                    "Estado": v["status"],
+                                    "Archivo": Path(v.get("archivo", "")).name if v.get("archivo") else ""
+                                } for k, v in batch_status.items()]),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+                        
+                        st.session_state["batch_generation_running"] = False
+                        progress_placeholder.success(f"✅ Proceso completado: {total_nits}/{total_nits} NITs procesados")
+                        rerun_app()
+                    
+                    if st.session_state.get("batch_generation_status"):
+                        st.subheader("📊 Estado de generación de reportes")
+                        
+                        batch_status = st.session_state.get("batch_generation_status", {})
+                        batch_report_type = st.session_state.get("batch_generation_report_type", "Agrupado por factura")
+                        
+                        status_data = []
+                        for nit, info in batch_status.items():
+                            status_data.append({
+                                "NIT": nit,
+                                "Estado": info["status"],
+                                "Archivo": info.get("archivo", ""),
+                                "Error": info.get("error", "")
+                            })
+                        
+                        df_status = pd.DataFrame(status_data)
+                        
+                        def make_download_link(filepath):
+                            if not filepath or not Path(filepath).exists():
+                                return ""
+                            try:
+                                with open(filepath, "rb") as f:
+                                    b64 = base64.b64encode(f.read()).decode()
+                                filename = Path(filepath).name
+                                return f"data:text/csv;name={filename};base64,{b64}"
+                            except Exception:
+                                return ""
+                        
+                        df_status["Descargar"] = df_status["Archivo"].apply(make_download_link)
+                        
+                        display_cols = ["NIT", "Estado", "Descargar", "Error"]
+                        df_display = df_status[display_cols]
+                        
+                        st.dataframe(
+                            df_display,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "NIT": st.column_config.TextColumn("NIT"),
+                                "Estado": st.column_config.TextColumn("Estado"),
+                                "Descargar": st.column_config.LinkColumn(
+                                    f"📥 {batch_report_type}",
+                                    display_text="Descargar"
+                                ),
+                                "Error": st.column_config.TextColumn("Error")
+                            }
+                        )
+                        
+                        completed = sum(1 for info in batch_status.values() if info["status"] == "completado")
+                        errors = sum(1 for info in batch_status.values() if info["status"] == "error")
+                        total = len(batch_status)
+                        
+                        col_m1, col_m2, col_m3 = st.columns(3)
+                        with col_m1:
+                            st.metric("Total procesados", f"{total}")
+                        with col_m2:
+                            st.metric("Completados", f"{completed}", delta=f"{int(completed/total*100)}%" if total > 0 else "0%")
+                        with col_m3:
+                            st.metric("Errores", f"{errors}")
+            else:
+                st.warning("No se encontraron NITs en la base de datos.")
+                
+        except Exception as exc:
+            st.error(f"Error al cargar NITs: {exc}")
+            import traceback
+            st.code(traceback.format_exc())
+    
+    st.divider()
+    st.header("🔍 Búsqueda individual de registros")
+    st.subheader("Filtros de búsqueda")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        nit_filter = st.text_input(
+            "Buscar por NIT",
+            placeholder="Ingresa el NIT completo o parcial",
+            help="Puedes buscar por NIT completo o parcial"
+        ).strip()
+    
+    with col2:
+        factura_filter = st.text_input(
+            "Buscar por Número de Factura",
+            placeholder="Ingresa el número de factura",
+            help="Busca por número de factura completo o parcial"
+        ).strip()
+    
+    if not nit_filter and not factura_filter:
+        st.info("👆 Ingresa al menos un criterio de búsqueda (NIT y/o número de factura) para ver los registros.")
+        return
+
+    st.subheader("Opciones de visualización")
+    
+    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
+    
+    with col_btn1:
+        btn_ver_todo = st.button(
+            "📋 Ver todo",
+            help="Muestra todos los registros con el detalle completo de servicios, glosas y conciliación",
+            use_container_width=True
+        )
+    
+    with col_btn2:
+        btn_ver_glosados = st.button(
+            "⚠️ Ver glosados",
+            help="Muestra solo los registros que tienen valor de glosa mayor a cero",
+            use_container_width=True
+        )
+    
+    with col_btn3:
+        btn_ver_por_estado = st.button(
+            "🔍 Ver por estado",
+            help="Filtra registros glosados por estado específico (contabilizada, devolución, eliminada)",
+            use_container_width=True
+        )
+    
+    with col_btn4:
+        agrupado = st.checkbox(
+            "📊 Agrupar por factura",
+            help="Agrupa los resultados por factura en lugar de mostrar el detalle línea por línea",
+            value=False
+        )
+    
+    estado_filter = None
+    if btn_ver_por_estado:
+        estado_filter = st.selectbox(
+            "Selecciona el estado",
+            options=["contabilizada", "devolución", "eliminada"],
+            help="Filtra los registros glosados por el estado seleccionado"
+        )
+    
+    page_size = 100
+    if "reports_page" not in st.session_state:
+        st.session_state.reports_page = 0
+    
+    filter_type = None
+    if btn_ver_todo:
+        filter_type = "ver_todo"
+        st.session_state.reports_page = 0
+    elif btn_ver_glosados:
+        filter_type = "ver_glosados"
+        st.session_state.reports_page = 0
+    elif btn_ver_por_estado and estado_filter:
+        filter_type = "ver_por_estado"
+        st.session_state.reports_page = 0
+        st.session_state.reports_estado_filter = estado_filter
+    
+    if filter_type or "reports_data_full" in st.session_state:
+        if filter_type:
+            with st.spinner("Consultando registros..."):
+                try:
+                    conn = pymysql.connect(
+                        host=cfg["host"],
+                        port=cfg["port"],
+                        user=cfg["user"],
+                        password=cfg["password"],
+                        database=cfg["database"],
+                        cursorclass=pymysql.cursors.DictCursor,
+                    )
+                    
+                    try:
+                        with conn.cursor() as cursor:
+                            if agrupado:
+                                query = """
+                                SELECT
+                                    aud.factura_id,
+                                    aud.origin,
+                                    aud.nit,
+                                    aud.razon_social,
+                                    aud.numero_factura,
+                                    aud.fecha_inicio,
+                                    aud.fecha_fin,
+                                    aud.modalidad,
+                                    aud.regimen,
+                                    aud.cobertura,
+                                    aud.contrato,
+                                    SUM(aud.valor_total_servicio) AS valor_total_servicios,
+                                    GROUP_CONCAT(DISTINCT aud.codigos_glosa ORDER BY aud.codigos_glosa SEPARATOR '-') AS codigos_glosa,
+                                    SUM(aud.valor_glosa) AS valor_glosa,
+                                    SUM(aud.valor_aprobado) AS valor_aprobado,
+                                    GROUP_CONCAT(DISTINCT eafr.ESTADO ORDER BY eafr.ESTADO SEPARATOR '-') AS estado,
+                                    SUM(ci.accepted_value_eps) AS valor_aceptado_eps,
+                                    SUM(ci.accepted_value_ips) AS valor_aceptado_ips,
+                                    SUM(ci.eps_ratified_value) AS valor_ratificado,
+                                    MAX(ci.observation) AS observacion_conciliacion,
+                                    MAX(ci.created_at) AS fecha_creacion,
+                                    CASE
+                                        WHEN MAX(eafr.ESTADO = 'contabilizada') = 1 AND SUM(aud.valor_glosa) > 0 THEN
+                                            CASE
+                                                WHEN COUNT(ci.id) > 0 THEN 'CONCILIADO'
+                                                ELSE 'NO CONCILIADA'
+                                            END
+                                        ELSE 'NO REQUIERE CONCILIACION'
+                                    END AS estado_conciliacion
+                                FROM auditory_final_reports aud
+                                INNER JOIN estados_auditory_final_reports eafr
+                                    ON eafr.ID = aud.id
+                                INNER JOIN invoice_audits ia
+                                    ON ia.id = aud.factura_id
+                                INNER JOIN thirds t
+                                    ON t.id = ia.third_id
+                                LEFT JOIN conciliation_results ci
+                                    ON ci.auditory_final_report_id = aud.id
+                                WHERE 1=1
+                                """
+                            else:
+                                query = """
+                                SELECT
+                                    aud.id,
+                                    aud.factura_id,
+                                    aud.servicio_id,
+                                    aud.origin,
+                                    aud.nit,
+                                    aud.razon_social,
+                                    aud.numero_factura,
+                                    aud.fecha_inicio,
+                                    aud.fecha_fin,
+                                    aud.modalidad,
+                                    aud.regimen,
+                                    aud.cobertura,
+                                    aud.contrato,
+                                    aud.tipo_documento,
+                                    aud.numero_documento,
+                                    aud.primer_nombre,
+                                    aud.segundo_nombre,
+                                    aud.primer_apellido,
+                                    aud.segundo_apellido,
+                                    aud.genero,
+                                    aud.codigo_servicio,
+                                    aud.descripcion_servicio,
+                                    aud.cantidad_servicio,
+                                    aud.valor_unitario_servicio,
+                                    aud.valor_total_servicio,
+                                    aud.codigos_glosa,
+                                    aud.observaciones_glosas,
+                                    aud.valor_glosa,
+                                    aud.valor_aprobado,
+                                    eafr.ESTADO AS estado,
+                                    ci.accepted_value_eps AS valor_aceptado_eps,
+                                    ci.accepted_value_ips AS valor_aceptado_ips,
+                                    ci.eps_ratified_value AS valor_ratificado,
+                                    ci.observation AS observacion_conciliacion,
+                                    ci.created_at AS fecha_creacion,
+                                    CASE
+                                        WHEN eafr.ESTADO = 'contabilizada' AND aud.valor_glosa > 0 THEN
+                                            CASE
+                                                WHEN ci.id IS NOT NULL THEN 'CONCILIADO'
+                                                ELSE 'NO CONCILIADA'
+                                            END
+                                        ELSE 'NO REQUIERE CONCILIACION'
+                                    END AS estado_conciliacion
+                                FROM auditory_final_reports aud
+                                INNER JOIN estados_auditory_final_reports eafr
+                                    ON eafr.ID = aud.id
+                                INNER JOIN invoice_audits ia
+                                    ON ia.id = aud.factura_id
+                                INNER JOIN thirds t
+                                    ON t.id = ia.third_id
+                                LEFT JOIN conciliation_results ci
+                                    ON ci.auditory_final_report_id = aud.id
+                                WHERE 1=1
+                                """
+                            
+                            params = []
+                            if nit_filter:
+                                query += " AND t.id LIKE %s"
+                                params.append(f"%{nit_filter}%")
+                            
+                            if factura_filter:
+                                query += " AND aud.numero_factura LIKE %s"
+                                params.append(f"%{factura_filter}%")
+                            
+                            if filter_type == "ver_glosados":
+                                query += " AND aud.valor_glosa > 0"
+                            elif filter_type == "ver_por_estado":
+                                query += " AND aud.valor_glosa > 0"
+                                query += " AND eafr.ESTADO = %s"
+                                params.append(estado_filter)
+                            
+                            if agrupado:
+                                query += """
+                                GROUP BY
+                                    aud.factura_id,
+                                    aud.origin,
+                                    aud.nit,
+                                    aud.razon_social,
+                                    aud.numero_factura,
+                                    aud.fecha_inicio,
+                                    aud.fecha_fin,
+                                    aud.modalidad,
+                                    aud.regimen,
+                                    aud.cobertura,
+                                    aud.contrato
+                                """
+                            
+                            query += " ORDER BY aud.id DESC"
+                            
+                            cursor.execute(query, params)
+                            rows = cursor.fetchall()
+                    finally:
+                        conn.close()
+                    
+                    if not rows:
+                        st.warning("No se encontraron registros con los criterios de búsqueda especificados.")
+                        st.session_state.pop("reports_data_full", None)
+                        return
+                    
+                    df_full = pd.DataFrame(rows)
+                    st.session_state["reports_data_full"] = df_full
+                    st.session_state["reports_filter_type"] = filter_type
+                    st.session_state["reports_agrupado"] = agrupado
+                    
+                except Exception as exc:
+                    st.error(f"Error al consultar los datos: {exc}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    return
+        
+        if "reports_data_full" in st.session_state:
+            df_full = st.session_state["reports_data_full"]
+            total_records = len(df_full)
+            
+            st.success(f"✅ Total de registros encontrados: **{total_records:,}**")
+            
+            total_pages = (total_records + page_size - 1) // page_size
+            current_page = st.session_state.reports_page
+            
+            start_idx = current_page * page_size
+            end_idx = min(start_idx + page_size, total_records)
+            df_page = df_full.iloc[start_idx:end_idx]
+            
+            st.subheader(f"Resultados (página {current_page + 1} de {total_pages})")
+            st.caption(f"Mostrando registros {start_idx + 1} a {end_idx} de {total_records:,} totales")
+            
+            pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_page.columns}
+            st.dataframe(
+                df_page,
+                use_container_width=True,
+                hide_index=True,
+                column_config=pretty_cols,
+            )
+            
+            if total_pages > 1:
+                col_prev, col_info, col_next = st.columns([1, 2, 1])
+                with col_prev:
+                    if st.button("⬅️ Anterior", disabled=(current_page == 0)):
+                        st.session_state.reports_page = max(0, current_page - 1)
+                        rerun_app()
+                with col_info:
+                    st.write(f"Página {current_page + 1} de {total_pages}")
+                with col_next:
+                    if st.button("Siguiente ➡️", disabled=(current_page >= total_pages - 1)):
+                        st.session_state.reports_page = min(total_pages - 1, current_page + 1)
+                        rerun_app()
+            
+            st.subheader("Descargar reporte completo")
+            
+            csv_data = df_full.to_csv(index=False, sep=";").encode("utf-8")
+            
+            filename_parts = []
+            if nit_filter:
+                filename_parts.append(f"nit_{nit_filter}")
+            if factura_filter:
+                filename_parts.append(f"fact_{factura_filter}")
+            filter_type_name = st.session_state.get("reports_filter_type", "todo")
+            filename_parts.append(filter_type_name)
+            if st.session_state.get("reports_agrupado"):
+                filename_parts.append("agrupado")
+            
+            filename = f"reporte_auditoria_{'_'.join(filename_parts)}.csv"
+            
+            st.download_button(
+                label=f"📥 Descargar CSV completo ({total_records:,} registros)",
+                data=csv_data,
+                file_name=filename,
+                mime="text/csv",
+                help="Descarga todos los registros que coinciden con tus criterios de búsqueda (no paginado)"
+            )
+
+
 def render_loader_page():
     st.title(APP_TITLE)
     st.caption("Sube tu CSV, mira el progreso en vivo y descarga los resultados.")
@@ -1090,6 +1797,233 @@ def render_loader_page():
         except Exception as ex:
             st.error(f"No fue posible listar actas: {ex}")
 
+    with st.expander("🗑️ Eliminar registros de conciliación", expanded=False):
+        st.caption("Sube un archivo Excel con los registros a eliminar. Solo se eliminarán registros con eps_ratified_value > 0")
+        
+        delete_file = st.file_uploader(
+            "Selecciona archivo Excel con registros a eliminar",
+            type=["xlsx", "xls"],
+            key="delete_excel_upload",
+            help="El archivo debe contener al menos la columna 'id' (puede ser en mayúsculas o minúsculas)"
+        )
+        
+        st.session_state.setdefault("delete_validation_done", False)
+        st.session_state.setdefault("delete_records_to_process", None)
+        st.session_state.setdefault("delete_show_confirmation", False)
+        
+        if delete_file:
+            col_val, col_clear = st.columns([1, 1])
+            with col_val:
+                if st.button("📋 Validar registros", type="primary", use_container_width=True):
+                    try:
+                        df_delete = pd.read_excel(delete_file)
+                        
+                        df_delete.columns = [col.lower() for col in df_delete.columns]
+                        
+                        if 'id' not in df_delete.columns:
+                            st.error("❌ El archivo debe contener la columna 'id'")
+                        else:
+                            ids_to_check = df_delete['id'].dropna().astype(str).tolist()
+                            
+                            if not ids_to_check:
+                                st.error("❌ No se encontraron IDs válidos en el archivo")
+                            else:
+                                st.info(f"🔍 Validando {len(ids_to_check)} registros...")
+                                
+                                cfg, missing = get_db_config()
+                                if missing:
+                                    st.error("Faltan variables de entorno MySQL: " + ", ".join(missing))
+                                else:
+                                    import pymysql
+                                    conn = pymysql.connect(
+                                        host=cfg["host"],
+                                        port=cfg["port"],
+                                        user=cfg["user"],
+                                        password=cfg["password"],
+                                        database=cfg["database"],
+                                        cursorclass=pymysql.cursors.DictCursor,
+                                    )
+                                    
+                                    validation_results = []
+                                    
+                                    try:
+                                        with conn.cursor() as cursor:
+                                            for audit_id in ids_to_check:
+                                                cursor.execute("""
+                                                    SELECT 
+                                                        cr.id,
+                                                        cr.auditory_final_report_id,
+                                                        cr.eps_ratified_value,
+                                                        afr.nit,
+                                                        afr.razon_social,
+                                                        afr.numero_factura
+                                                    FROM conciliation_results cr
+                                                    LEFT JOIN auditory_final_reports afr 
+                                                        ON cr.auditory_final_report_id = afr.id
+                                                    WHERE cr.auditory_final_report_id = %s
+                                                """, (audit_id,))
+                                                
+                                                row = cursor.fetchone()
+                                                
+                                                if row:
+                                                    eps_ratified = float(row.get('eps_ratified_value', 0) or 0)
+                                                    can_delete = eps_ratified > 0
+                                                    
+                                                    validation_results.append({
+                                                        'ID Auditoría': audit_id,
+                                                        'ID Conciliación': row.get('id'),
+                                                        'NIT': row.get('nit', 'N/A'),
+                                                        'Razón Social': row.get('razon_social', 'N/A'),
+                                                        'Factura': row.get('numero_factura', 'N/A'),
+                                                        'Valor Ratificado': eps_ratified,
+                                                        'Estado': '✅ Puede eliminarse' if can_delete else '❌ NO puede eliminarse (valor ratificado = 0)',
+                                                        'Eliminar': can_delete
+                                                    })
+                                                else:
+                                                    validation_results.append({
+                                                        'ID Auditoría': audit_id,
+                                                        'ID Conciliación': None,
+                                                        'NIT': 'N/A',
+                                                        'Razón Social': 'N/A',
+                                                        'Factura': 'N/A',
+                                                        'Valor Ratificado': 0,
+                                                        'Estado': '⚠️ No encontrado en conciliation_results',
+                                                        'Eliminar': False
+                                                    })
+                                    finally:
+                                        conn.close()
+                                    
+                                    df_validation = pd.DataFrame(validation_results)
+                                    st.session_state["delete_records_to_process"] = df_validation
+                                    st.session_state["delete_validation_done"] = True
+                                    st.session_state["delete_show_confirmation"] = True
+                                    rerun_app()
+                    
+                    except Exception as exc:
+                        st.error(f"❌ Error al validar archivo: {exc}")
+                        import traceback
+                        st.code(traceback.format_exc())
+            
+            with col_clear:
+                if st.button("🔄 Limpiar", use_container_width=True):
+                    st.session_state["delete_validation_done"] = False
+                    st.session_state["delete_records_to_process"] = None
+                    st.session_state["delete_show_confirmation"] = False
+                    rerun_app()
+        
+        if st.session_state.get("delete_show_confirmation") and st.session_state.get("delete_records_to_process") is not None:
+            df_val = st.session_state["delete_records_to_process"]
+            
+            st.divider()
+            st.subheader("📊 Resumen de validación")
+            
+            can_delete = df_val[df_val['Eliminar'] == True]
+            cannot_delete = df_val[df_val['Eliminar'] == False]
+            
+            col_m1, col_m2, col_m3 = st.columns(3)
+            with col_m1:
+                st.metric("Total registros", len(df_val))
+            with col_m2:
+                st.metric("✅ Pueden eliminarse", len(can_delete), delta="OK", delta_color="normal")
+            with col_m3:
+                st.metric("❌ NO pueden eliminarse", len(cannot_delete), delta="Bloqueados", delta_color="inverse")
+            
+            st.dataframe(
+                df_val,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "ID Auditoría": st.column_config.NumberColumn("ID Auditoría"),
+                    "ID Conciliación": st.column_config.NumberColumn("ID Conciliación"),
+                    "NIT": st.column_config.TextColumn("NIT"),
+                    "Razón Social": st.column_config.TextColumn("Razón Social"),
+                    "Factura": st.column_config.TextColumn("Factura"),
+                    "Valor Ratificado": st.column_config.NumberColumn("Valor Ratificado", format="%.2f"),
+                    "Estado": st.column_config.TextColumn("Estado"),
+                    "Eliminar": st.column_config.CheckboxColumn("Eliminar", disabled=True)
+                }
+            )
+            
+            if len(cannot_delete) > 0:
+                with st.expander("⚠️ Ver registros que NO pueden eliminarse", expanded=False):
+                    st.dataframe(
+                        cannot_delete[['ID Auditoría', 'NIT', 'Razón Social', 'Factura', 'Valor Ratificado', 'Estado']],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            
+            if len(can_delete) > 0:
+                st.warning(f"⚠️ **ATENCIÓN**: Estás a punto de eliminar {len(can_delete)} registro(s) de la tabla `conciliation_results`. Esta acción NO se puede deshacer.")
+                
+                confirm_text = st.text_input(
+                    "Para confirmar, escribe 'ELIMINAR' en mayúsculas:",
+                    key="delete_confirm_text",
+                    placeholder="ELIMINAR"
+                )
+                
+                if st.button("🗑️ CONFIRMAR ELIMINACIÓN", type="primary", disabled=(confirm_text != "ELIMINAR")):
+                    if confirm_text == "ELIMINAR":
+                        try:
+                            cfg, missing = get_db_config()
+                            if missing:
+                                st.error("Faltan variables de entorno MySQL")
+                            else:
+                                import pymysql
+                                conn = pymysql.connect(
+                                    host=cfg["host"],
+                                    port=cfg["port"],
+                                    user=cfg["user"],
+                                    password=cfg["password"],
+                                    database=cfg["database"],
+                                )
+                                
+                                deleted_count = 0
+                                deletion_log = []
+                                
+                                try:
+                                    with conn.cursor() as cursor:
+                                        for _, row in can_delete.iterrows():
+                                            conciliation_id = row['ID Conciliación']
+                                            audit_id = row['ID Auditoría']
+                                            
+                                            cursor.execute(
+                                                "DELETE FROM conciliation_results WHERE id = %s",
+                                                (conciliation_id,)
+                                            )
+                                            
+                                            if cursor.rowcount > 0:
+                                                deleted_count += 1
+                                                deletion_log.append(f"✅ Eliminado: ID Conciliación {conciliation_id} (Auditoría {audit_id}) - {row['Razón Social']} - Factura {row['Factura']}")
+                                            else:
+                                                deletion_log.append(f"⚠️ No se pudo eliminar: ID Conciliación {conciliation_id}")
+                                        
+                                        conn.commit()
+                                    
+                                    st.success(f"✅ Se eliminaron {deleted_count} registro(s) exitosamente")
+                                    
+                                    with st.expander("📋 Ver log de eliminación", expanded=True):
+                                        for log_entry in deletion_log:
+                                            st.text(log_entry)
+                                    
+                                    st.session_state["delete_validation_done"] = False
+                                    st.session_state["delete_records_to_process"] = None
+                                    st.session_state["delete_show_confirmation"] = False
+                                    
+                                except Exception as e:
+                                    conn.rollback()
+                                    st.error(f"❌ Error durante la eliminación: {e}")
+                                    import traceback
+                                    st.code(traceback.format_exc())
+                                finally:
+                                    conn.close()
+                        
+                        except Exception as exc:
+                            st.error(f"❌ Error al conectar con la base de datos: {exc}")
+                    else:
+                        st.error("Debes escribir 'ELIMINAR' para confirmar")
+            else:
+                st.info("ℹ️ No hay registros que puedan eliminarse")
+
     with st.expander("Generar sábana por %", expanded=False):
         pct_file = st.file_uploader(
             "Excel de conciliación",
@@ -1155,7 +2089,7 @@ def main():
     ensure_dirs()
 
     default_menu = st.session_state.get("menu_option", "Cargar CSV")
-    menu_options = ["Cargar CSV", "Resumen"]
+    menu_options = ["Cargar CSV", "Resumen", "Reportes"]
 
     show_detail_option = bool(st.session_state.get("selected_nit"))
     if show_detail_option:
@@ -1178,6 +2112,8 @@ def main():
         render_summary_page()
     elif menu_option == "Detalle NIT":
         render_nit_detail_page()
+    elif menu_option == "Reportes":
+        render_reports_page()
     else:
         render_loader_page()
 
