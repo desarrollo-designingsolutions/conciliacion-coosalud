@@ -4,3 +4,4 @@ pymysql
 python-dateutil
 python-dotenv
 streamlit>=1.36
+boto3
