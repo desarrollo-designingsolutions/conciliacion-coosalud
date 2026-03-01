@@ -11,6 +11,20 @@ import pandas as pd
 import pymysql
 import streamlit as st
 from csv_conciliation_loader import EXPECTED_HEADERS
+from s3_storage import read_file_bytes, s3_enabled, upload_file, build_s3_key
+from new_invoices_loader import (
+    read_new_invoices_csv,
+    validate_new_invoices_csv,
+    write_errors_csv as write_new_invoice_errors,
+    get_mysql_conn as get_new_invoices_conn,
+    build_origin,
+    insert_new_invoices,
+    generate_sabana_excel,
+    ensure_imports_table,
+    register_import,
+    parse_decimal_maybe_comma as parse_dec_comma,
+    SABANA_OUTPUT_DIRNAME,
+)
 
 USERS_ENV_VAR = "APP_USERS"
 DB_ENV_VARS = {
@@ -479,6 +493,13 @@ def render_state_form(cfg: dict, nit: str, razon: str | None, prefix: str) -> No
                             file_path = str(pdf_dir / file_name)
                             with open(file_path, "wb") as f:
                                 f.write(pdf_file.getbuffer())
+                            # Subir a S3 si está habilitado
+                            stored_path = file_path
+                            if s3_enabled():
+                                s3_key = build_s3_key(f"actas_pdf/{file_name}")
+                                s3_ok, s3_result = upload_file(file_path, s3_key)
+                                if s3_ok:
+                                    stored_path = s3_key
                             acta_pdf_id = str(uuid.uuid4())
                             insert_acta_pdf_record(
                                 cfg,
@@ -486,7 +507,7 @@ def render_state_form(cfg: dict, nit: str, razon: str | None, prefix: str) -> No
                                 nit,
                                 razon or "",
                                 original_name,
-                                file_path,
+                                stored_path,
                                 user_email or "",
                                 nit_state_id,
                             )
@@ -590,17 +611,15 @@ def render_summary_page():
         excel_map: dict[str, list[str]] = {}
         for nit_val, _fname, fpath, _created in excel_rows:
             try:
-                p = Path(str(fpath))
-                if p.exists():
-                    with open(p, "rb") as f:
-                        b64 = base64.b64encode(f.read()).decode()
-                        # Incluir sugerencia de nombre para descarga
-                        safe_name = str(_fname or "acta.xlsx").replace(",", "_")
-                        url = (
-                            "data:application/"
-                            f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64,"
-                            + b64
-                        )
+                file_data = read_file_bytes(str(fpath)) if fpath else None
+                if file_data:
+                    b64 = base64.b64encode(file_data).decode()
+                    safe_name = str(_fname or "acta.xlsx").replace(",", "_")
+                    url = (
+                        "data:application/"
+                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64,"
+                        + b64
+                    )
                 else:
                     url = ""
             except Exception:
@@ -610,13 +629,11 @@ def render_summary_page():
         pdf_map: dict[str, list[str]] = {}
         for nit_val, _fname, fpath, _created in pdf_rows:
             try:
-                p = Path(str(fpath))
-                if p.exists():
-                    with open(p, "rb") as f:
-                        b64 = base64.b64encode(f.read()).decode()
-                        safe_name = str(_fname or "acta.pdf").replace(",", "_")
-                        # octet-stream para forzar descarga y sugerir nombre
-                        url = f"data:application/octet-stream;name={safe_name};base64,{b64}"
+                file_data = read_file_bytes(str(fpath)) if fpath else None
+                if file_data:
+                    b64 = base64.b64encode(file_data).decode()
+                    safe_name = str(_fname or "acta.pdf").replace(",", "_")
+                    url = f"data:application/octet-stream;name={safe_name};base64,{b64}"
                 else:
                     url = ""
             except Exception:
@@ -1755,11 +1772,11 @@ def render_loader_page():
                         import base64
                         download_urls = []
                         for _, r in df_act.iterrows():
-                            p = Path(str(r.get("file_path", "")))
-                            if p.exists():
+                            fpath = str(r.get("file_path", ""))
+                            file_data = read_file_bytes(fpath) if fpath else None
+                            if file_data:
                                 try:
-                                    with open(p, "rb") as f:
-                                        b64 = base64.b64encode(f.read()).decode()
+                                    b64 = base64.b64encode(file_data).decode()
                                     safe_name = str(r.get("file_name") or "acta.xlsx").replace(",", "_")
                                     url = (
                                         "data:application/"
@@ -2081,6 +2098,275 @@ def render_loader_page():
                     st.error(f"No se pudo generar la sábana: {exc}")
 
 
+def render_new_invoices_page():
+    st.title("Cargar nuevas facturas")
+    st.caption("Sube un CSV con nuevas facturas, valida y registra en el sistema.")
+
+    try:
+        cfg, missing = get_db_config()
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    if missing:
+        st.error("Faltan variables de entorno para la conexión MySQL: " + ", ".join(missing))
+        return
+
+    # --- Sección 1: Carga de CSV ---
+    uploaded = st.file_uploader("Sube el archivo CSV (separado por ;)", type=["csv"], key="new_inv_csv")
+
+    st.session_state.setdefault("new_inv_phase", "idle")
+    st.session_state.setdefault("new_inv_errors", None)
+    st.session_state.setdefault("new_inv_df", None)
+    st.session_state.setdefault("new_inv_nit", None)
+    st.session_state.setdefault("new_inv_result_msg", None)
+    st.session_state.setdefault("new_inv_sabana_path", None)
+
+    col_btn1, col_btn2 = st.columns([1, 1])
+    with col_btn1:
+        validate_btn = st.button("Validar archivo", type="primary", key="new_inv_validate_btn")
+    with col_btn2:
+        if st.button("Limpiar", key="new_inv_clear_btn"):
+            for k in ("new_inv_phase", "new_inv_errors", "new_inv_df", "new_inv_nit",
+                       "new_inv_result_msg", "new_inv_sabana_path"):
+                st.session_state.pop(k, None)
+            rerun_app()
+
+    if validate_btn:
+        if uploaded is None:
+            st.error("Primero sube un CSV.")
+        else:
+            dest = IN_DIR / (uploaded.name or "nuevas_facturas.csv")
+            with open(dest, "wb") as f:
+                f.write(uploaded.getbuffer())
+
+            try:
+                df = read_new_invoices_csv(str(dest))
+            except Exception as exc:
+                st.error(f"No se pudo leer el CSV: {exc}")
+                st.session_state["new_inv_phase"] = "idle"
+                rerun_app()
+                return
+
+            headers_in_file = list(df.columns)
+
+            conn, err = get_new_invoices_conn()
+            if conn is None:
+                st.error(f"No se pudo conectar a la BD: {err}")
+                return
+
+            try:
+                errors = validate_new_invoices_csv(df, headers_in_file, conn)
+            finally:
+                conn.close()
+
+            if errors:
+                err_path = OUT_DIR / "log_errores_nuevas_facturas.csv"
+                write_new_invoice_errors(errors, str(err_path))
+                st.session_state["new_inv_phase"] = "errors"
+                st.session_state["new_inv_errors"] = str(err_path)
+                st.session_state["new_inv_df"] = None
+            else:
+                nit_val = df["nit"].astype(str).str.strip().iloc[0]
+                st.session_state["new_inv_phase"] = "confirm"
+                st.session_state["new_inv_df"] = df
+                st.session_state["new_inv_nit"] = nit_val
+                st.session_state["new_inv_errors"] = None
+            rerun_app()
+
+    # Mostrar errores
+    if st.session_state.get("new_inv_phase") == "errors":
+        err_path = st.session_state.get("new_inv_errors")
+        st.error("Se encontraron errores de validación en el archivo.")
+        if err_path and Path(err_path).exists():
+            with open(err_path, "rb") as f:
+                st.download_button(
+                    "Descargar log de errores",
+                    data=f.read(),
+                    file_name="log_errores_nuevas_facturas.csv",
+                    mime="text/csv",
+                )
+            try:
+                df_err = pd.read_csv(err_path)
+                st.dataframe(df_err, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+    # Confirmación
+    if st.session_state.get("new_inv_phase") == "confirm":
+        df = st.session_state.get("new_inv_df")
+        nit_val = st.session_state.get("new_inv_nit")
+        if df is not None and not df.empty:
+            st.success(f"Validación exitosa. NIT: **{nit_val}** — {len(df)} facturas.")
+            st.subheader("Resumen de facturas a cargar")
+
+            # Calcular totales
+            total_vf = sum(parse_dec_comma(str(v)) for v in df["valor_factura"])
+            total_gl = sum(parse_dec_comma(str(v)) for v in df["glosa"])
+            col_m1, col_m2, col_m3 = st.columns(3)
+            with col_m1:
+                st.metric("Total facturas", len(df))
+            with col_m2:
+                st.metric("Valor factura total", f"${total_vf:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            with col_m3:
+                st.metric("Glosa total", f"${total_gl:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            col_conf, col_canc = st.columns(2)
+            with col_conf:
+                if st.button("Confirmar y registrar", type="primary", key="new_inv_confirm"):
+                    conn, err = get_new_invoices_conn()
+                    if conn is None:
+                        st.error(f"No se pudo conectar a la BD: {err}")
+                    else:
+                        try:
+                            origin = build_origin(nit_val)
+                            from datetime import datetime
+                            from zoneinfo import ZoneInfo
+                            fecha_proceso = datetime.now(ZoneInfo("America/Bogota")).strftime("%Y-%m-%d %H:%M:%S")
+
+                            ok, msg, count = insert_new_invoices(df, conn, nit_val, origin)
+                            if ok:
+                                # Generar sábana
+                                sab_ok, sab_path = generate_sabana_excel(conn, nit_val, origin, fecha_proceso, str(OUT_DIR))
+
+                                # Registrar importación
+                                ensure_imports_table(conn)
+                                razon = df["razon_social"].astype(str).str.strip().iloc[0]
+                                file_name = Path(sab_path).name if sab_ok else ""
+                                user_email = st.session_state.get("user_email", "")
+                                register_import(
+                                    conn, nit_val, razon, origin,
+                                    len(df), total_vf, total_gl,
+                                    file_name, sab_path if sab_ok else "",
+                                    user_email,
+                                )
+
+                                st.session_state["new_inv_phase"] = "done"
+                                st.session_state["new_inv_result_msg"] = msg
+                                st.session_state["new_inv_sabana_path"] = sab_path if sab_ok else None
+                            else:
+                                st.session_state["new_inv_phase"] = "done"
+                                st.session_state["new_inv_result_msg"] = msg
+                                st.session_state["new_inv_sabana_path"] = None
+                        except Exception as exc:
+                            st.error(f"Error durante el proceso: {exc}")
+                        finally:
+                            conn.close()
+                    rerun_app()
+
+            with col_canc:
+                if st.button("Cancelar", key="new_inv_cancel"):
+                    st.session_state["new_inv_phase"] = "idle"
+                    st.session_state["new_inv_df"] = None
+                    rerun_app()
+
+    # Resultado
+    if st.session_state.get("new_inv_phase") == "done":
+        msg = st.session_state.get("new_inv_result_msg", "")
+        sab_path = st.session_state.get("new_inv_sabana_path")
+        sab_data = read_file_bytes(sab_path) if sab_path else None
+        if sab_data:
+            st.success(msg)
+            sab_name = Path(sab_path).name if sab_path.startswith("/") else sab_path.rsplit("/", 1)[-1]
+            st.download_button(
+                "Descargar sábana Excel",
+                data=sab_data,
+                file_name=sab_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        elif msg:
+            st.error(msg)
+
+    # --- Sección 2: Historial de importaciones ---
+    with st.expander("Historial de importaciones", expanded=False):
+        nit_hist_filter = st.text_input(
+            "Filtrar por NIT (opcional)",
+            key="new_inv_hist_nit",
+            placeholder="Solo números",
+        )
+        nit_hist = "".join(ch for ch in (nit_hist_filter or "") if ch.isdigit())
+
+        try:
+            conn = pymysql.connect(
+                host=cfg["host"], port=cfg["port"], user=cfg["user"],
+                password=cfg["password"], database=cfg["database"],
+                cursorclass=pymysql.cursors.Cursor,
+            )
+            try:
+                with conn.cursor() as cur:
+                    # Verificar si la tabla existe
+                    cur.execute("""
+                        SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'new_invoice_imports'
+                    """, (cfg["database"],))
+                    if cur.fetchone()[0] == 0:
+                        st.info("Aún no hay importaciones registradas.")
+                    else:
+                        if nit_hist:
+                            cur.execute("""
+                                SELECT nit, razon_social, total_facturas, valor_factura_total,
+                                       glosa_total, usuario, created_at, file_name, file_path
+                                FROM new_invoice_imports
+                                WHERE nit = %s
+                                ORDER BY created_at DESC
+                                LIMIT 200
+                            """, (nit_hist,))
+                        else:
+                            cur.execute("""
+                                SELECT nit, razon_social, total_facturas, valor_factura_total,
+                                       glosa_total, usuario, created_at, file_name, file_path
+                                FROM new_invoice_imports
+                                ORDER BY created_at DESC
+                                LIMIT 200
+                            """)
+                        rows = cur.fetchall()
+                        cols = [d[0] for d in cur.description]
+                        df_hist = pd.DataFrame(rows, columns=cols)
+
+                        if df_hist.empty:
+                            st.info("No se encontraron importaciones." + (" Para el NIT ingresado." if nit_hist else ""))
+                        else:
+                            # Preparar columna de descarga
+                            download_urls = []
+                            for _, r in df_hist.iterrows():
+                                fpath = str(r.get("file_path", ""))
+                                file_data = read_file_bytes(fpath) if fpath else None
+                                if file_data:
+                                    try:
+                                        b64 = base64.b64encode(file_data).decode()
+                                        safe_name = str(r.get("file_name") or "sabana.xlsx").replace(",", "_")
+                                        url = f"data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64,{b64}"
+                                    except Exception:
+                                        url = ""
+                                else:
+                                    url = ""
+                                download_urls.append(url)
+
+                            df_hist["Descargar"] = pd.Series(download_urls, dtype=object)
+                            visible_cols = [c for c in df_hist.columns if c not in ("file_path", "file_name", "Descargar")] + ["Descargar"]
+                            df_view = df_hist[[c for c in visible_cols if c in df_hist.columns]]
+                            pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns if c != "Descargar"}
+                            st.data_editor(
+                                df_view,
+                                width='stretch',
+                                hide_index=True,
+                                disabled=True,
+                                column_config={
+                                    "Descargar": st.column_config.LinkColumn(
+                                        "Descargar",
+                                        display_text="Descargar sábana",
+                                    ),
+                                    **pretty_cols,
+                                },
+                            )
+            finally:
+                conn.close()
+        except Exception as exc:
+            st.error(f"Error al cargar historial: {exc}")
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -2089,7 +2375,7 @@ def main():
     ensure_dirs()
 
     default_menu = st.session_state.get("menu_option", "Cargar CSV")
-    menu_options = ["Cargar CSV", "Resumen", "Reportes"]
+    menu_options = ["Cargar CSV", "Cargar nuevas facturas", "Resumen", "Reportes"]
 
     show_detail_option = bool(st.session_state.get("selected_nit"))
     if show_detail_option:
@@ -2114,6 +2400,8 @@ def main():
         render_nit_detail_page()
     elif menu_option == "Reportes":
         render_reports_page()
+    elif menu_option == "Cargar nuevas facturas":
+        render_new_invoices_page()
     else:
         render_loader_page()
 

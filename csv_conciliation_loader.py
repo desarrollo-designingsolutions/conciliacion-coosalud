@@ -512,12 +512,23 @@ LIMIT 1
             sum_ips = total_ips.quantize(Decimal('0.01'))
             sum_rat = total_rat.quantize(Decimal('0.01'))
 
+            # Subir a S3 si está habilitado
+            from s3_storage import s3_enabled, upload_file, build_s3_key
+            stored_path = str(out_path)
+            if s3_enabled():
+                s3_key = build_s3_key(f"actas_conciliacion/{out_path.name}")
+                s3_ok, s3_result = upload_file(str(out_path), s3_key)
+                if s3_ok:
+                    stored_path = s3_key
+                else:
+                    error(f"No se pudo subir acta a S3: {s3_result}")
+
             record_info = {
                 'nit': nit,
                 'razon_social': razon_social,
                 'file_name': out_path.name,
-                'file_path': str(out_path),
-                'download_link': str(out_path),
+                'file_path': stored_path,
+                'download_link': stored_path,
                 'valor_glosa': str(sum_glosa),
                 'valor_aceptado_eps': str(sum_eps),
                 'valor_aceptado_ips': str(sum_ips),
@@ -542,7 +553,7 @@ LIMIT 1
                                 nit,
                                 razon_social,
                                 out_path.name,
-                                str(out_path),
+                                stored_path,
                                 str(sum_glosa),
                                 str(sum_eps),
                                 str(sum_ips),
