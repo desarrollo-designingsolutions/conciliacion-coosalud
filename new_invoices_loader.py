@@ -206,8 +206,11 @@ def validate_new_invoices_csv(
                 with conn.cursor() as cur:
                     placeholders = ",".join(["%s"] * len(facturas_list))
                     cur.execute(
-                        f"SELECT invoice_number FROM invoice_audits "
-                        f"WHERE third_id = %s AND invoice_number IN ({placeholders})",
+                        f"SELECT DISTINCT ia.invoice_number FROM invoice_audits ia "
+                        f"INNER JOIN auditory_final_reports afr ON afr.factura_id = ia.id "
+                        f"INNER JOIN estados_auditory_final_reports eafr ON eafr.ID = afr.id "
+                        f"WHERE ia.third_id = %s AND eafr.ESTADO = 'contabilizada' "
+                        f"AND ia.invoice_number IN ({placeholders})",
                         [nit_val] + facturas_list,
                     )
                     existentes = {row[0] for row in cur.fetchall()}
