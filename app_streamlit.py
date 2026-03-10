@@ -15,6 +15,7 @@ import streamlit as st
 from csv_conciliation_loader import EXPECTED_HEADERS
 from s3_storage import read_file_bytes, s3_enabled, upload_file, build_s3_key
 from dashboard_bi import render_dashboard_page
+from mesas_conciliacion import render_mesas_page
 from new_invoices_loader import (
     read_new_invoices_csv,
     validate_new_invoices_csv,
@@ -2418,7 +2419,7 @@ def main():
     ensure_dirs()
 
     default_menu = st.session_state.get("menu_option", "Cargar CSV")
-    menu_options = ["Cargar CSV", "Cargar nuevas facturas", "Resumen", "Reportes", "Dashboard BI"]
+    menu_options = ["Cargar CSV", "Cargar nuevas facturas", "Resumen", "Reportes", "Dashboard BI", "Mesas de Conciliación"]
 
     show_detail_option = bool(st.session_state.get("selected_nit"))
     if show_detail_option:
@@ -2449,6 +2450,8 @@ def main():
         render_new_invoices_page()
     elif menu_option == "Dashboard BI":
         render_dashboard_page()
+    elif menu_option == "Mesas de Conciliación":
+        render_mesas_page()
     else:
         render_loader_page()
 
