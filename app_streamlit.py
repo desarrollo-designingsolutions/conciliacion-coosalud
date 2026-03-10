@@ -2,6 +2,8 @@
 import os
 import time
 import base64
+import hashlib
+import hmac
 import subprocess
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from new_invoices_loader import (
 )
 
 USERS_ENV_VAR = "APP_USERS"
+SESSION_SECRET = os.getenv("SESSION_SECRET", "c00salud-s3ss10n-d3fault-k3y")
 DB_ENV_VARS = {
     "host": "MYSQL_HOST",
     "port": "MYSQL_PORT",
@@ -85,6 +88,29 @@ LOG_FILE = OUT_DIR / "runtime.log"
 
 # ------------------------- Utils -------------------------
 
+
+def _make_token(email: str) -> str:
+    """Crea un token firmado con HMAC: base64(email)|signature."""
+    email_b64 = base64.urlsafe_b64encode(email.encode()).decode()
+    sig = hmac.new(SESSION_SECRET.encode(), email.encode(), hashlib.sha256).hexdigest()
+    return f"{email_b64}.{sig}"
+
+
+def _verify_token(token: str):
+    """Verifica el token firmado. Retorna el email si es válido, None si no."""
+    if not token or "." not in token:
+        return None
+    try:
+        email_b64, sig = token.rsplit(".", 1)
+        email = base64.urlsafe_b64decode(email_b64.encode()).decode()
+    except Exception:
+        return None
+    expected = hmac.new(SESSION_SECRET.encode(), email.encode(), hashlib.sha256).hexdigest()
+    if hmac.compare_digest(sig, expected):
+        return email
+    return None
+
+
 def ensure_dirs():
     IN_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,8 +158,22 @@ def require_login():
         )
         st.stop()
 
+    # Ya autenticado en esta sesión
     if st.session_state.get("auth_ok"):
         return st.session_state.get("user_email")
+
+    # Intentar restaurar sesión desde token en URL (?session=...)
+    token = st.query_params.get("session")
+    if token:
+        email_from_token = _verify_token(token)
+        if email_from_token and email_from_token in users:
+            st.session_state.auth_ok = True
+            st.session_state.user_email = email_from_token
+            st.session_state.last_email = email_from_token
+            return email_from_token
+        else:
+            # Token inválido, limpiarlo de la URL
+            del st.query_params["session"]
 
     last_email = st.session_state.get("last_email", "")
     login_error = st.session_state.get("login_error")
@@ -154,6 +194,8 @@ def require_login():
             st.session_state.user_email = trimmed_email
             st.session_state.login_error = ""
             st.session_state.last_email = trimmed_email
+            # Guardar token en la URL para persistir sesión entre refreshes
+            st.query_params["session"] = _make_token(trimmed_email)
             rerun_app()
         else:
             st.session_state.login_error = "Correo o contraseña incorrectos."
@@ -2385,6 +2427,8 @@ def main():
     with st.sidebar:
         st.markdown(f"**Usuario:** {user_email}")
         if st.button("Cerrar sesión"):
+            if "session" in st.query_params:
+                del st.query_params["session"]
             for key in ("auth_ok", "user_email", "login_error", "last_email"):
                 st.session_state.pop(key, None)
             rerun_app()
