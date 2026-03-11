@@ -23,7 +23,7 @@ import uuid
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font
 
 try:
     import pymysql
@@ -168,6 +168,46 @@ def write_errors_csv(errors: list[ErrorRow], out_path: str) -> None:
                 e.consecutivo, e.id_, e.factura_id, e.origin, e.nit, e.razon_social,
                 e.numero_factura, e.fila, e.columna, e.valor, e.error, e.validacion
             ])
+
+
+def _next_acta_number(conn) -> int:
+    """Obtiene el siguiente número de acta global desde conciliation_proceedings."""
+    if conn is None:
+        return 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT COALESCE(MAX(acta_number), 0) + 1 FROM conciliation_proceedings")
+        return cur.fetchone()[0]
+
+
+def _create_proceeding(conn, acta_number: int, nit: str, razon_social: str,
+                       file_name: str, file_path: str, usuario: str) -> str | None:
+    """Inserta un registro en conciliation_proceedings y retorna su id."""
+    if conn is None:
+        return None
+    import uuid
+    proc_id = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO conciliation_proceedings
+            (id, acta_number, provider_nit, provider_name, file_name, file_path, status, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s, 'generated', %s)
+            """,
+            (proc_id, acta_number, nit, razon_social, file_name, file_path, usuario),
+        )
+    return proc_id
+
+
+def _link_results_to_proceeding(conn, proceeding_id: str, result_ids: list[str]):
+    """Vincula registros de conciliation_results al proceeding."""
+    if conn is None or not proceeding_id or not result_ids:
+        return
+    with conn.cursor() as cur:
+        placeholders = ",".join(["%s"] * len(result_ids))
+        cur.execute(
+            f"UPDATE conciliation_results SET proceeding_id = %s WHERE id IN ({placeholders})",
+            [proceeding_id] + result_ids,
+        )
 
 
 def generate_acta_excels(df: pd.DataFrame, ids: list[str], out_dir: str, conn) -> list[dict]:
@@ -488,9 +528,26 @@ LIMIT 1
             )
             ws[f"A{footer_row}"] = footer_text
 
-            timestamp = current_dt.strftime("%Y%m%d_%H%M%S")
+            # Nota aclaratoria debajo de la cláusula existente (row 20 en plantilla)
+            nota_row = 21 + row_shift
+            nota_text = (
+                "Nota aclaratoria:\n"
+                "Para el cierre de los procesos de conciliación, las Instituciones Prestadoras de Servicios "
+                "de Salud (IPS) y/o proveedores deben remitir la nota crédito correspondiente a los valores "
+                "aceptados, como soporte contable del acta.\n"
+                "Las notas crédito deben enviarse a los correos notificaciones@utam.com.co; "
+                "900226715_cuentasdesalud@factureinbox.co, indicando número de factura, valor y causal de emisión."
+            )
+            ws[f"A{nota_row}"] = nota_text
+            ws[f"A{nota_row}"].alignment = Alignment(wrap_text=True, vertical="top")
+
+            # Numeración de acta
+            acta_number = _next_acta_number(conn)
+            acta_number_str = str(acta_number).zfill(4)
+            ws["H2"] = acta_number_str
+
             safe_nit = ''.join(ch for ch in str(nit) if ch.isalnum()) or "sin_nit"
-            out_path = acta_dir / f"acta_conciliacion_{safe_nit}_{timestamp}.xlsx"
+            out_path = acta_dir / f"GF-F-16 ACTA DE CONCILIACION {safe_nit} {acta_number_str}.xlsx"
             try:
                 wb.save(out_path)
             except TypeError as exc:
@@ -533,6 +590,7 @@ LIMIT 1
                 'valor_aceptado_eps': str(sum_eps),
                 'valor_aceptado_ips': str(sum_ips),
                 'valor_ratificado': str(sum_rat),
+                'acta_number': acta_number_str,
             }
             generated_records.append(record_info)
 
@@ -540,6 +598,17 @@ LIMIT 1
                 try:
                     import uuid
                     acta_id = str(uuid.uuid4())
+
+                    # Crear registro en conciliation_proceedings
+                    proceeding_id = _create_proceeding(
+                        conn, acta_number, nit, razon_social,
+                        out_path.name, stored_path, usuario_default,
+                    )
+
+                    # Vincular los conciliation_results de este NIT al proceeding
+                    result_ids = pair_rows["ID"].tolist() if "ID" in pair_rows.columns else []
+                    _link_results_to_proceeding(conn, proceeding_id, result_ids)
+
                     with conn.cursor() as cur:
                         cur.execute(
                             """
