@@ -1401,7 +1401,7 @@ def main():
     if args.dry_run:
         info("DRY-RUN habilitado: se validará conexión MySQL y se generará resumen, sin insertar.")
         conn, err = get_mysql_conn_from_env()
-        already = set()
+        fully_conciliated = set()  # Grupo B: rat=0, ya completamente conciliados
         if conn is None:
             info(f"No se validará contra MySQL: {err}")
         else:
@@ -1413,10 +1413,18 @@ def main():
                         chunk = ids[i:i+chunk_size]
                         placeholders = ",".join(["%s"] * len(chunk))
                         cur.execute(
-                            f"SELECT auditory_final_report_id FROM conciliation_results WHERE auditory_final_report_id IN ({placeholders})",
+                            f"""SELECT auditory_final_report_id, eps_ratified_value
+                                FROM conciliation_results
+                                WHERE auditory_final_report_id IN ({placeholders})""",
                             chunk
                         )
-                        already.update(row[0] for row in cur.fetchall())
+                        for row in cur.fetchall():
+                            afr_id = row[0]
+                            rat_value = Decimal(str(row[1] or 0))
+                            if rat_value <= 0:
+                                # Grupo B: completamente conciliado, excluir
+                                fully_conciliated.add(afr_id)
+                            # Grupo C (rat > 0): re-conciliable, NO excluir
             except Exception as ex:
                 error(f"No fue posible consultar conciliaciones existentes en dry-run: {ex}")
             finally:
@@ -1425,13 +1433,12 @@ def main():
                 except Exception:
                     pass
 
-        ids_to_insert = [i for i in ids if i not in already]
-        if already:
-            info(f"IDs ya conciliados detectados en dry-run: {len(already)}; serán excluidos del resumen.")
-        else:
-            info("No se detectaron IDs ya conciliados en dry-run.")
+        ids_to_process = [i for i in ids if i not in fully_conciliated]
+        if fully_conciliated:
+            info(f"IDs completamente conciliados (sin ratificado) en dry-run: {len(fully_conciliated)}; excluidos del resumen.")
+        info(f"IDs para procesar en dry-run: {len(ids_to_process)} (nuevos + re-conciliables).")
 
-        summary_path = _write_dry_run_summary(df, args.out_dir, ids_to_insert)
+        summary_path = _write_dry_run_summary(df, args.out_dir, ids_to_process)
         if summary_path:
             info(f"Resumen de dry-run generado en: {summary_path}")
         info("=== Fin de DRY-RUN ===")

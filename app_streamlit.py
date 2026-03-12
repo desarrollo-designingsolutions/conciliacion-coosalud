@@ -1664,8 +1664,7 @@ def render_loader_page():
                     log_box.code(new_text, language="log")
                     text_l = new_text.lower()
                     if (
-                        "ids ya conciliados detectados" in text_l
-                        or "ya estaban conciliados" in text_l
+                        "ya están completamente conciliados" in text_l
                         or "ya se encuentran conciliadas" in text_l
                     ):
                         st.session_state.already_conciliated_detected = True
@@ -1688,8 +1687,7 @@ def render_loader_page():
                     log_box.code(new_text, language="log")
                     text_l = new_text.lower()
                     if (
-                        "ids ya conciliados detectados" in text_l
-                        or "ya estaban conciliados" in text_l
+                        "ya están completamente conciliados" in text_l
                         or "ya se encuentran conciliadas" in text_l
                     ):
                         st.session_state.already_conciliated_detected = True
