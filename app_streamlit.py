@@ -652,30 +652,29 @@ def render_summary_page():
         finally:
             conn.close()
 
-        excel_map: dict[str, list[tuple[str, str, bytes]]] = {}
+        from s3_storage import generate_presigned_url, s3_enabled as _s3_on
+
+        excel_map: dict[str, list[str]] = {}
         for nit_val, _fname, fpath, _created in excel_rows:
             try:
-                file_data = read_file_bytes(str(fpath)) if fpath else None
-                if file_data:
+                fpath_str = str(fpath) if fpath else ""
+                if fpath_str and not fpath_str.startswith("/") and _s3_on():
                     safe_name = str(_fname or "acta.xlsx").replace(",", "_")
-                    b64 = base64.b64encode(file_data).decode()
-                    url = (
-                        "data:application/"
-                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + b64
-                    )
-                    excel_map.setdefault(str(nit_val), []).append((safe_name, url, file_data))
+                    url = generate_presigned_url(fpath_str, safe_name) or ""
+                    if url:
+                        excel_map.setdefault(str(nit_val), []).append(url)
             except Exception:
                 pass
 
-        pdf_map: dict[str, list[tuple[str, str, bytes]]] = {}
+        pdf_map: dict[str, list[str]] = {}
         for nit_val, _fname, fpath, _created in pdf_rows:
             try:
-                file_data = read_file_bytes(str(fpath)) if fpath else None
-                if file_data:
+                fpath_str = str(fpath) if fpath else ""
+                if fpath_str and not fpath_str.startswith("/") and _s3_on():
                     safe_name = str(_fname or "acta.pdf").replace(",", "_")
-                    b64 = base64.b64encode(file_data).decode()
-                    url = f"data:application/octet-stream;base64,{b64}"
-                    pdf_map.setdefault(str(nit_val), []).append((safe_name, url, file_data))
+                    url = generate_presigned_url(fpath_str, safe_name) or ""
+                    if url:
+                        pdf_map.setdefault(str(nit_val), []).append(url)
             except Exception:
                 pass
 
@@ -686,17 +685,13 @@ def render_summary_page():
             col_name = ("Actas excel" if i == 0 else f"Actas excel {i+1}")
             link_cols.append(col_name)
             df_view[col_name] = df_view["nit"].map(
-                lambda n, idx=i: (
-                    [t[1] for t in excel_map.get(str(n), [])] + [""] * max_excel
-                )[idx]
+                lambda n, idx=i: (excel_map.get(str(n), []) + [""] * max_excel)[idx]
             )
         for i in range(max_pdf):
             col_name = ("Actas pdf" if i == 0 else f"Actas pdf {i+1}")
             link_cols.append(col_name)
             df_view[col_name] = df_view["nit"].map(
-                lambda n, idx=i: (
-                    [t[1] for t in pdf_map.get(str(n), [])] + [""] * max_pdf
-                )[idx]
+                lambda n, idx=i: (pdf_map.get(str(n), []) + [""] * max_pdf)[idx]
             )
     except Exception:
         link_cols = []
@@ -732,38 +727,6 @@ def render_summary_page():
         },
         key="summary_table_editor",
     )
-
-    # Botones de descarga con nombre correcto
-    if excel_map or pdf_map:
-        with st.expander("Descargar actas con nombre correcto", expanded=False):
-            for nit_val in df_view["nit"].astype(str).unique():
-                files_excel = excel_map.get(nit_val, [])
-                files_pdf = pdf_map.get(nit_val, [])
-                if not files_excel and not files_pdf:
-                    continue
-                st.caption(f"NIT: {nit_val}")
-                btn_cols = st.columns(max(len(files_excel) + len(files_pdf), 1))
-                col_idx = 0
-                for fname, _url, fdata in files_excel:
-                    with btn_cols[col_idx]:
-                        st.download_button(
-                            f"📊 {fname}",
-                            data=fdata,
-                            file_name=fname,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"dl_resumen_xl_{nit_val}_{col_idx}",
-                        )
-                    col_idx += 1
-                for fname, _url, fdata in files_pdf:
-                    with btn_cols[col_idx]:
-                        st.download_button(
-                            f"📄 {fname}",
-                            data=fdata,
-                            file_name=fname,
-                            mime="application/pdf",
-                            key=f"dl_resumen_pdf_{nit_val}_{col_idx}",
-                        )
-                    col_idx += 1
 
     st.download_button(
         "Descargar CSV",
@@ -1847,57 +1810,41 @@ def render_loader_page():
                             else:
                                 st.info("Aún no hay actas registradas para descargar.")
                             return
-                        # Construir columna de descarga con data URLs para la tabla
-                        import base64
+                        # Construir columna de descarga con URLs pre-firmadas de S3
+                        from s3_storage import generate_presigned_url, s3_enabled
                         download_urls = []
-                        file_cache: list[tuple[str, bytes | None]] = []
                         for _, r in df_act.iterrows():
                             fpath = str(r.get("file_path", ""))
                             safe_name = str(r.get("file_name") or "acta.xlsx").replace(",", "_")
-                            file_data = read_file_bytes(fpath) if fpath else None
-                            file_cache.append((safe_name, file_data))
-                            if file_data:
-                                try:
-                                    b64 = base64.b64encode(file_data).decode()
-                                    url = (
-                                        "data:application/"
-                                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + b64
-                                    )
-                                except Exception:
-                                    url = ""
-                            else:
-                                url = ""
+                            url = ""
+                            if fpath and not fpath.startswith("/") and s3_enabled():
+                                presigned = generate_presigned_url(fpath, safe_name)
+                                if presigned:
+                                    url = presigned
                             download_urls.append(url)
                         df_act["Descargar"] = pd.Series(download_urls, dtype=object)
 
-                        visible_cols = [c for c in df_act.columns if c not in ("file_path", "Descargar")] + ["Descargar"]
-                        df_view = df_act[[c for c in visible_cols if c in df_act.columns]]
-                        pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns if c != "Descargar"}
-                        st.data_editor(
-                            df_view,
-                            width='stretch',
-                            hide_index=True,
-                            disabled=True,
-                            column_config={
-                                "Descargar": st.column_config.LinkColumn(
-                                    "Descargar",
-                                    display_text="⬇️ Descargar",
-                                ),
-                                **pretty_cols,
-                            },
-                        )
-
-                        # Botones de descarga con nombre correcto
-                        st.caption("Descarga con nombre correcto:")
-                        for idx, (safe_name, file_data) in enumerate(file_cache):
-                            if file_data:
-                                st.download_button(
-                                    f"📥 {safe_name}",
-                                    data=file_data,
-                                    file_name=safe_name,
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"dl_acta_{idx}",
-                                )
+                        # Solo mostrar filas con descarga disponible en S3
+                        df_act_available = df_act[df_act["Descargar"] != ""].copy()
+                        if df_act_available.empty:
+                            st.info("No hay actas disponibles para descarga en S3.")
+                        else:
+                            visible_cols = [c for c in df_act_available.columns if c not in ("file_path", "Descargar")] + ["Descargar"]
+                            df_view = df_act_available[[c for c in visible_cols if c in df_act_available.columns]]
+                            pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns if c != "Descargar"}
+                            st.data_editor(
+                                df_view,
+                                width='stretch',
+                                hide_index=True,
+                                disabled=True,
+                                column_config={
+                                    "Descargar": st.column_config.LinkColumn(
+                                        "Descargar",
+                                        display_text="⬇️ Descargar",
+                                    ),
+                                    **pretty_cols,
+                                },
+                            )
                 finally:
                     conn.close()
         except Exception as ex:
