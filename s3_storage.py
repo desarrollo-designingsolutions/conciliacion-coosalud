@@ -90,6 +90,30 @@ def download_file_bytes(s3_key: str) -> tuple[bytes | None, str]:
         return None, f"Error descargando de S3: {exc}"
 
 
+def generate_presigned_url(s3_key: str, filename: str, expiration: int = 3600) -> str | None:
+    """
+    Genera una URL pre-firmada para descargar un archivo de S3 con el nombre indicado.
+    Retorna la URL o None si falla.
+    """
+    client, bucket, _ = get_s3_client()
+    if client is None:
+        return None
+    try:
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": s3_key,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            },
+            ExpiresIn=expiration,
+        )
+        return url
+    except Exception as exc:
+        logging.error(f"S3: error generando URL pre-firmada para {s3_key}: {exc}")
+        return None
+
+
 def read_file_bytes(file_path: str) -> bytes | None:
     """
     Lee archivo desde disco local o S3 según la ruta.
