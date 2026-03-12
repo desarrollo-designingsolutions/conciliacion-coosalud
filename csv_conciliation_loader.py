@@ -198,15 +198,24 @@ def _create_proceeding(conn, acta_number: int, nit: str, razon_social: str,
     return proc_id
 
 
-def _link_results_to_proceeding(conn, proceeding_id: str, result_ids: list[str]):
-    """Vincula registros de conciliation_results al proceeding."""
-    if conn is None or not proceeding_id or not result_ids:
+def _link_results_to_proceeding(conn, proceeding_id: str, afr_ids: list[str]):
+    """Vincula registros de conciliation_results al proceeding por auditory_final_report_id."""
+    if conn is None or not proceeding_id or not afr_ids:
         return
     with conn.cursor() as cur:
-        placeholders = ",".join(["%s"] * len(result_ids))
+        placeholders = ",".join(["%s"] * len(afr_ids))
         cur.execute(
-            f"UPDATE conciliation_results SET proceeding_id = %s WHERE id IN ({placeholders})",
-            [proceeding_id] + result_ids,
+            f"UPDATE conciliation_results SET proceeding_id = %s WHERE auditory_final_report_id IN ({placeholders})",
+            [proceeding_id] + afr_ids,
+        )
+        # Actualizar proceeding_id_after en el historial más reciente
+        cur.execute(
+            f"""UPDATE conciliation_results_history crh
+                INNER JOIN conciliation_results cr ON cr.id = crh.conciliation_result_id
+                SET crh.proceeding_id_after = %s
+                WHERE cr.auditory_final_report_id IN ({placeholders})
+                AND crh.proceeding_id_after IS NULL""",
+            [proceeding_id] + afr_ids,
         )
 
 
@@ -821,36 +830,129 @@ def mysql_phase_and_success_report(df: pd.DataFrame, out_dir: str, ids: list[str
 
     try:
         with conn.cursor() as cur:
-            # 0) Filtrar IDs ya conciliados para no intentarlos de nuevo
-            debug("Verificando conciliaciones existentes en lotes…")
-            existing = set()
+            # 0) Clasificar IDs en 3 grupos:
+            #    A) Sin conciliación previa → INSERT
+            #    B) Con conciliación previa, eps_ratified_value == 0 → RECHAZAR
+            #    C) Con conciliación previa, eps_ratified_value > 0 → UPDATE acumulativo
+            debug("Clasificando IDs: nuevos / ya conciliados / re-conciliables…")
+            existing_records: dict[str, dict] = {}  # afr_id → {cr_id, eps, ips, rat, proceeding_id}
             chunk_size = 1000
             for i in range(0, len(ids), chunk_size):
                 chunk = ids[i:i+chunk_size]
                 placeholders = ",".join(["%s"] * len(chunk))
                 cur.execute(
-                    f"SELECT auditory_final_report_id FROM conciliation_results WHERE auditory_final_report_id IN ({placeholders})",
+                    f"""SELECT cr.id, cr.auditory_final_report_id,
+                               cr.accepted_value_ips, cr.accepted_value_eps,
+                               cr.eps_ratified_value, cr.proceeding_id
+                        FROM conciliation_results cr
+                        WHERE cr.auditory_final_report_id IN ({placeholders})""",
                     chunk
                 )
-                existing.update(row[0] for row in cur.fetchall())
+                for row in cur.fetchall():
+                    existing_records[row[1]] = {
+                        'cr_id': row[0],
+                        'ips': Decimal(str(row[2] or 0)),
+                        'eps': Decimal(str(row[3] or 0)),
+                        'rat': Decimal(str(row[4] or 0)),
+                        'proceeding_id': row[5],
+                    }
 
-            already_conciliated = sorted(list(existing))
-            had_already_conciliated = bool(already_conciliated)
-            ids_to_process = [i for i in ids if i not in existing]
+            group_a_ids = []  # nuevos → INSERT
+            group_b_ids = []  # ya completamente conciliados → RECHAZAR
+            group_c_ids = []  # re-conciliables → UPDATE
+            for afr_id in ids:
+                if afr_id not in existing_records:
+                    group_a_ids.append(afr_id)
+                elif existing_records[afr_id]['rat'] > 0:
+                    group_c_ids.append(afr_id)
+                else:
+                    group_b_ids.append(afr_id)
 
-            if already_conciliated:
-                info(f"IDs ya conciliados detectados: {len(already_conciliated)}")
-                # Registrar errores por cada uno
-                msg = "Ese servicio ya se encuentra conciliado."
-                errors = _sql_error_rows_for_ids(df, already_conciliated, msg)
+            info(f"Clasificación: {len(group_a_ids)} nuevos, {len(group_c_ids)} re-conciliables, {len(group_b_ids)} ya conciliados.")
+
+            # Registrar errores para Grupo B
+            if group_b_ids:
+                msg = "Ese servicio ya se encuentra completamente conciliado (valor ratificado = 0)."
+                errors = _sql_error_rows_for_ids(df, group_b_ids, msg)
                 out_err = os.path.join(out_dir, "log_errores.csv")
                 write_errors_csv(errors, out_err)
-                if not ids_to_process:
-                    info("Todos los servicios del CSV ya estaban conciliados; no se generarán actas.")
-                    return False, "Las facturas cargadas ya se encuentran conciliadas en el sistema.", ""
 
-            # 1) Preparar los registros a insertar desde el DataFrame (solo IDs a procesar)
-            info(f"Preparando datos para inserción masiva (pendientes: {len(ids_to_process)})…")
+            ids_to_process = group_a_ids + group_c_ids
+            if not ids_to_process:
+                info("No hay servicios para procesar.")
+                return False, "Todos los servicios del CSV ya están completamente conciliados.", ""
+
+            # ──────────────────────────────────────────────
+            # Grupo C: Validación de re-conciliación
+            # ──────────────────────────────────────────────
+            group_c_validated = []
+            group_c_errors = []
+            for afr_id in group_c_ids:
+                row_csv = df[df["ID"] == afr_id].iloc[0]
+                try:
+                    csv_glosa = parse_decimal_maybe_comma(row_csv.get("VALOR_GLOSA", ""))
+                except Exception:
+                    group_c_errors.append((afr_id, "No se pudo parsear VALOR_GLOSA"))
+                    continue
+
+                db_rec = existing_records[afr_id]
+                db_rat = db_rec['rat']
+
+                if csv_glosa != db_rat:
+                    group_c_errors.append((
+                        afr_id,
+                        f"VALOR_GLOSA del CSV ({csv_glosa}) no coincide con el valor ratificado actual en BD ({db_rat})."
+                    ))
+                    continue
+
+                # Validar que el acumulado no exceda la glosa original
+                try:
+                    csv_eps = parse_decimal_maybe_comma(row_csv.get("VALOR_ACEPTADO_POR_EPS", ""))
+                    csv_ips = parse_decimal_maybe_comma(row_csv.get("VALOR_ACEPTADO_POR_IPS", ""))
+                    csv_rat = parse_decimal_maybe_comma(row_csv.get("VALOR_RATIFICADO_EPS", ""))
+                except Exception:
+                    group_c_errors.append((afr_id, "No se pudieron parsear los valores de conciliación"))
+                    continue
+
+                new_eps = db_rec['eps'] + csv_eps
+                new_ips = db_rec['ips'] + csv_ips
+                new_total = new_eps + new_ips + csv_rat
+
+                # Obtener glosa original de auditory_final_reports
+                cur.execute(
+                    "SELECT valor_glosa FROM auditory_final_reports WHERE id = %s", (afr_id,)
+                )
+                afr_row = cur.fetchone()
+                if not afr_row:
+                    group_c_errors.append((afr_id, "No se encontró el registro en auditory_final_reports"))
+                    continue
+                glosa_original = Decimal(str(afr_row[0] or 0))
+
+                if new_total > glosa_original:
+                    group_c_errors.append((
+                        afr_id,
+                        f"El total acumulado ({new_total}) excede la glosa original ({glosa_original})."
+                    ))
+                    continue
+
+                group_c_validated.append(afr_id)
+
+            # Registrar errores de validación del Grupo C
+            if group_c_errors:
+                error_ids = [e[0] for e in group_c_errors]
+                for afr_id, msg in group_c_errors:
+                    info(f"Error re-conciliación {afr_id}: {msg}")
+                errors = _sql_error_rows_for_ids(df, error_ids, "Error de validación en re-conciliación")
+                out_err = os.path.join(out_dir, "log_errores.csv")
+                write_errors_csv(errors, out_err)
+
+            # Recalcular ids_to_process con solo los validados
+            ids_to_process = group_a_ids + group_c_validated
+            if not ids_to_process:
+                return False, "No hay servicios válidos para procesar tras la validación.", ""
+
+            # 1) Preparar los registros desde el DataFrame
+            info(f"Preparando datos para procesamiento (nuevos: {len(group_a_ids)}, re-conciliables: {len(group_c_validated)})…")
 
             tmp_rows = []
             df_sub = df[df["ID"].isin(ids_to_process)].copy()
@@ -859,25 +961,22 @@ def mysql_phase_and_success_report(df: pd.DataFrame, out_dir: str, ids: list[str
                 afr_id = str(row["ID"]).strip()
                 resp_status = (str(row.get("ESTADO_RESPUESTA","")).strip() or None)
                 autorization = (str(row.get("NUMERO_DE_AUTORIZACION","")).strip() or None)
-                # Normalizar decimales
                 try:
                     ips = parse_decimal_maybe_comma(row.get("VALOR_ACEPTADO_POR_IPS",""))
                     eps = parse_decimal_maybe_comma(row.get("VALOR_ACEPTADO_POR_EPS",""))
                     rat = parse_decimal_maybe_comma(row.get("VALOR_RATIFICADO_EPS",""))
                 except InvalidOperation:
-                    # Si algo raro pasó (no debería), saltar ese registro
                     continue
                 ips_str = format(ips, 'f')
                 eps_str = format(eps, 'f')
                 rat_str = format(rat, 'f')
                 observation = (str(row.get("OBSERVACIONES","")).strip() or None)
-
                 tmp_rows.append((afr_id, resp_status, autorization, ips_str, eps_str, rat_str, observation))
 
             if not tmp_rows:
-                return False, "No hay filas válidas para insertar (tras filtrar y normalizar).", ""
+                return False, "No hay filas válidas para procesar (tras filtrar y normalizar).", ""
 
-            # 2) Crear tabla temporal y cargar por lotes con colación fija
+            # 2) Crear tabla temporal y cargar por lotes
             cur.execute("""
                 CREATE TEMPORARY TABLE IF NOT EXISTS tmp_conciliation_in (
                   afr_id CHAR(36) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
@@ -907,9 +1006,13 @@ def mysql_phase_and_success_report(df: pd.DataFrame, out_dir: str, ids: list[str
             conn.commit()
             debug("Commit de carga temporal completado.")
 
-            # 3) ÚNICO INSERT … SELECT (rápido) con colaciones alineadas
-            info("Ejecutando inserción masiva en conciliation_results…")
-            insert_bulk_sql = """
+            # ──────────────────────────────────────────────
+            # 3a) INSERT masivo para Grupo A (nuevos)
+            # ──────────────────────────────────────────────
+            inserted = 0
+            if group_a_ids:
+                info("Ejecutando inserción masiva para registros nuevos (Grupo A)…")
+                insert_bulk_sql = """
 INSERT INTO conciliation_results
 (
   id,
@@ -953,47 +1056,129 @@ LEFT JOIN conciliation_results cr
   ON cr.auditory_final_report_id COLLATE utf8mb4_unicode_ci = afr.id COLLATE utf8mb4_unicode_ci
 WHERE cr.id IS NULL
 """
-            cur.execute(insert_bulk_sql)
-            inserted = cur.rowcount  # filas insertadas
-            info(f"Inserción masiva completada. Registros insertados: {inserted}")
+                cur.execute(insert_bulk_sql)
+                inserted = cur.rowcount
+                info(f"Inserción masiva completada. Registros insertados: {inserted}")
 
-            if inserted > 0:
-                info("Actualizando tabla thirds_summary_conciliation con los nuevos valores…")
-                update_summary_sql = """
-INSERT INTO thirds_summary_conciliation (
-  nit,
-  valor_aceptado_eps,
-  valor_aceptado_ips,
-  valor_ratificado
-)
-SELECT
-  ia.third_id AS nit,
-  SUM(tmp.accepted_value_eps) AS valor_aceptado_eps,
-  SUM(tmp.accepted_value_ips) AS valor_aceptado_ips,
-  SUM(tmp.eps_ratified_value) AS valor_ratificado
+            # ──────────────────────────────────────────────
+            # 3b) UPDATE acumulativo para Grupo C (re-conciliación)
+            # ──────────────────────────────────────────────
+            updated = 0
+            usuario_default = os.getenv("ACTA_GENERATION_USER") or os.getenv("APP_USER") or os.getenv("USER") or "system"
+            if group_c_validated:
+                info(f"Ejecutando re-conciliación para {len(group_c_validated)} registros (Grupo C)…")
+                for afr_id in group_c_validated:
+                    db_rec = existing_records[afr_id]
+                    cr_id = db_rec['cr_id']
+
+                    # Leer valores del CSV desde la tabla temporal
+                    cur.execute(
+                        "SELECT accepted_value_ips, accepted_value_eps, eps_ratified_value, "
+                        "response_status, autorization_number, observation "
+                        "FROM tmp_conciliation_in WHERE afr_id = %s", (afr_id,)
+                    )
+                    tmp_row = cur.fetchone()
+                    if not tmp_row:
+                        continue
+                    csv_ips, csv_eps, csv_rat = Decimal(str(tmp_row[0])), Decimal(str(tmp_row[1])), Decimal(str(tmp_row[2]))
+                    csv_resp, csv_auth, csv_obs = tmp_row[3], tmp_row[4], tmp_row[5]
+
+                    # Guardar historial (before/after)
+                    import uuid
+                    history_id = str(uuid.uuid4())
+                    cur.execute(
+                        """INSERT INTO conciliation_results_history
+                           (id, conciliation_result_id, proceeding_id_before,
+                            accepted_value_ips_before, accepted_value_eps_before, eps_ratified_value_before,
+                            accepted_value_ips_after, accepted_value_eps_after, eps_ratified_value_after,
+                            observation, created_by)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (
+                            history_id, cr_id, db_rec['proceeding_id'],
+                            str(db_rec['ips']), str(db_rec['eps']), str(db_rec['rat']),
+                            str(db_rec['ips'] + csv_ips), str(db_rec['eps'] + csv_eps), str(csv_rat),
+                            csv_obs, usuario_default,
+                        )
+                    )
+
+                    # UPDATE acumulativo
+                    cur.execute(
+                        """UPDATE conciliation_results SET
+                             accepted_value_ips = accepted_value_ips + %s,
+                             accepted_value_eps = accepted_value_eps + %s,
+                             eps_ratified_value = %s,
+                             response_status = COALESCE(%s, response_status),
+                             autorization_number = COALESCE(%s, autorization_number),
+                             observation = COALESCE(%s, observation),
+                             updated_at = NOW()
+                           WHERE id = %s""",
+                        (str(csv_ips), str(csv_eps), str(csv_rat),
+                         csv_resp, csv_auth, csv_obs, cr_id)
+                    )
+                    updated += 1
+
+                info(f"Re-conciliación completada. Registros actualizados: {updated}")
+
+            # ──────────────────────────────────────────────
+            # 4) Actualizar thirds_summary_conciliation
+            # ──────────────────────────────────────────────
+            if inserted > 0 or updated > 0:
+                info("Actualizando tabla thirds_summary_conciliation…")
+
+                # Para Grupo A: sumar los valores completos del CSV
+                if group_a_ids:
+                    a_placeholders = ",".join(["%s"] * len(group_a_ids))
+                    update_summary_a = f"""
+INSERT INTO thirds_summary_conciliation (nit, valor_aceptado_eps, valor_aceptado_ips, valor_ratificado)
+SELECT ia.third_id AS nit,
+       SUM(tmp.accepted_value_eps), SUM(tmp.accepted_value_ips), SUM(tmp.eps_ratified_value)
 FROM tmp_conciliation_in tmp
-INNER JOIN auditory_final_reports afr
-  ON afr.id COLLATE utf8mb4_unicode_ci = tmp.afr_id COLLATE utf8mb4_unicode_ci
-INNER JOIN invoice_audits ia
-  ON ia.id COLLATE utf8mb4_unicode_ci = afr.factura_id COLLATE utf8mb4_unicode_ci
+INNER JOIN auditory_final_reports afr ON afr.id COLLATE utf8mb4_unicode_ci = tmp.afr_id COLLATE utf8mb4_unicode_ci
+INNER JOIN invoice_audits ia ON ia.id COLLATE utf8mb4_unicode_ci = afr.factura_id COLLATE utf8mb4_unicode_ci
+WHERE tmp.afr_id IN ({a_placeholders})
 GROUP BY ia.third_id
 ON DUPLICATE KEY UPDATE
   valor_aceptado_eps = valor_aceptado_eps + VALUES(valor_aceptado_eps),
   valor_aceptado_ips = valor_aceptado_ips + VALUES(valor_aceptado_ips),
-  valor_ratificado  = valor_ratificado  + VALUES(valor_ratificado)
+  valor_ratificado   = valor_ratificado   + VALUES(valor_ratificado)
 """
-                cur.execute(update_summary_sql)
+                    cur.execute(update_summary_a, group_a_ids)
+
+                # Para Grupo C: sumar delta de eps/ips, y ajustar ratificado (delta negativo)
+                if group_c_validated:
+                    c_placeholders = ",".join(["%s"] * len(group_c_validated))
+                    # Los valores en tmp son los del CSV (lo nuevo conciliado).
+                    # El delta de ratificado = csv_rat - old_rat (negativo porque disminuye).
+                    # Usamos una subconsulta para obtener el old_rat de conciliation_results_history.
+                    update_summary_c = f"""
+INSERT INTO thirds_summary_conciliation (nit, valor_aceptado_eps, valor_aceptado_ips, valor_ratificado)
+SELECT ia.third_id AS nit,
+       SUM(tmp.accepted_value_eps) AS delta_eps,
+       SUM(tmp.accepted_value_ips) AS delta_ips,
+       SUM(tmp.eps_ratified_value - crh.eps_ratified_value_before) AS delta_rat
+FROM tmp_conciliation_in tmp
+INNER JOIN auditory_final_reports afr ON afr.id COLLATE utf8mb4_unicode_ci = tmp.afr_id COLLATE utf8mb4_unicode_ci
+INNER JOIN invoice_audits ia ON ia.id COLLATE utf8mb4_unicode_ci = afr.factura_id COLLATE utf8mb4_unicode_ci
+INNER JOIN conciliation_results cr ON cr.auditory_final_report_id COLLATE utf8mb4_unicode_ci = afr.id COLLATE utf8mb4_unicode_ci
+INNER JOIN conciliation_results_history crh ON crh.conciliation_result_id = cr.id
+  AND crh.created_at = (SELECT MAX(created_at) FROM conciliation_results_history WHERE conciliation_result_id = cr.id)
+WHERE tmp.afr_id IN ({c_placeholders})
+GROUP BY ia.third_id
+ON DUPLICATE KEY UPDATE
+  valor_aceptado_eps = valor_aceptado_eps + VALUES(valor_aceptado_eps),
+  valor_aceptado_ips = valor_aceptado_ips + VALUES(valor_aceptado_ips),
+  valor_ratificado   = valor_ratificado   + VALUES(valor_ratificado)
+"""
+                    cur.execute(update_summary_c, group_c_validated)
+
                 info("Resumen actualizado correctamente.")
 
             conn.commit()
 
-            # 4) Generar CSV de éxito (JOIN filtrado por IDs del CSV)
-            # Si hubo IDs ya conciliados, omitir generación de actas.
-            if 'had_already_conciliated' in locals() and had_already_conciliated:
-                info("Se omite la generación de actas por detectar IDs ya conciliados en la carga.")
-                return _generate_success_join(conn, out_dir, ids)
-            else:
-                return _finalize_success(conn, df, out_dir, ids)
+            # ──────────────────────────────────────────────
+            # 5) Generar actas y CSV de éxito
+            # ──────────────────────────────────────────────
+            return _finalize_success(conn, df, out_dir, ids_to_process)
 
     except Exception as ex:
         # Registrar el error SQL por cada ID que intentábamos procesar
