@@ -621,6 +621,7 @@ def render_summary_page():
     df_view["Acciones"] = False
 
     # Cargar archivos de actas por NIT (Excel/PDF) para descarga
+    link_cols: list[str] = []
     try:
         conn = pymysql.connect(
             host=cfg["host"],
@@ -651,34 +652,60 @@ def render_summary_page():
         finally:
             conn.close()
 
-        excel_map: dict[str, list[tuple[str, bytes]]] = {}
+        excel_map: dict[str, list[tuple[str, str, bytes]]] = {}
         for nit_val, _fname, fpath, _created in excel_rows:
             try:
                 file_data = read_file_bytes(str(fpath)) if fpath else None
                 if file_data:
                     safe_name = str(_fname or "acta.xlsx").replace(",", "_")
-                    excel_map.setdefault(str(nit_val), []).append((safe_name, file_data))
+                    b64 = base64.b64encode(file_data).decode()
+                    url = (
+                        "data:application/"
+                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + b64
+                    )
+                    excel_map.setdefault(str(nit_val), []).append((safe_name, url, file_data))
             except Exception:
                 pass
 
-        pdf_map: dict[str, list[tuple[str, bytes]]] = {}
+        pdf_map: dict[str, list[tuple[str, str, bytes]]] = {}
         for nit_val, _fname, fpath, _created in pdf_rows:
             try:
                 file_data = read_file_bytes(str(fpath)) if fpath else None
                 if file_data:
                     safe_name = str(_fname or "acta.pdf").replace(",", "_")
-                    pdf_map.setdefault(str(nit_val), []).append((safe_name, file_data))
+                    b64 = base64.b64encode(file_data).decode()
+                    url = f"data:application/octet-stream;base64,{b64}"
+                    pdf_map.setdefault(str(nit_val), []).append((safe_name, url, file_data))
             except Exception:
                 pass
 
+        max_excel = max((len(v) for v in excel_map.values()), default=0)
+        max_pdf = max((len(v) for v in pdf_map.values()), default=0)
+
+        for i in range(max_excel):
+            col_name = ("Actas excel" if i == 0 else f"Actas excel {i+1}")
+            link_cols.append(col_name)
+            df_view[col_name] = df_view["nit"].map(
+                lambda n, idx=i: (
+                    [t[1] for t in excel_map.get(str(n), [])] + [""] * max_excel
+                )[idx]
+            )
+        for i in range(max_pdf):
+            col_name = ("Actas pdf" if i == 0 else f"Actas pdf {i+1}")
+            link_cols.append(col_name)
+            df_view[col_name] = df_view["nit"].map(
+                lambda n, idx=i: (
+                    [t[1] for t in pdf_map.get(str(n), [])] + [""] * max_pdf
+                )[idx]
+            )
     except Exception:
-        pass
+        link_cols = []
 
     # Configurar etiquetas amigables para columnas base (reemplazar '_' por ' ')
     pretty_labels = {
         col: st.column_config.Column(col.replace("_", " "))
         for col in df_view.columns
-        if col != "Acciones"
+        if col != "Acciones" and col not in link_cols
     }
 
     editor_result = st.data_editor(
@@ -692,23 +719,32 @@ def render_summary_page():
                 help="Agregar estado al NIT",
                 default=False,
             ),
+            **{
+                col: st.column_config.LinkColumn(
+                    col,
+                    display_text=(
+                        "Descargar Acta" if col.lower().startswith("actas excel") else "Acta firmada"
+                    ),
+                )
+                for col in link_cols
+            },
             **pretty_labels,
         },
         key="summary_table_editor",
     )
 
-    # Botones de descarga de actas por NIT con nombre correcto
+    # Botones de descarga con nombre correcto
     if excel_map or pdf_map:
-        with st.expander("Descargar actas por NIT", expanded=False):
+        with st.expander("Descargar actas con nombre correcto", expanded=False):
             for nit_val in df_view["nit"].astype(str).unique():
                 files_excel = excel_map.get(nit_val, [])
                 files_pdf = pdf_map.get(nit_val, [])
                 if not files_excel and not files_pdf:
                     continue
                 st.caption(f"NIT: {nit_val}")
-                btn_cols = st.columns(len(files_excel) + len(files_pdf))
+                btn_cols = st.columns(max(len(files_excel) + len(files_pdf), 1))
                 col_idx = 0
-                for fname, fdata in files_excel:
+                for fname, _url, fdata in files_excel:
                     with btn_cols[col_idx]:
                         st.download_button(
                             f"📊 {fname}",
@@ -718,7 +754,7 @@ def render_summary_page():
                             key=f"dl_resumen_xl_{nit_val}_{col_idx}",
                         )
                     col_idx += 1
-                for fname, fdata in files_pdf:
+                for fname, _url, fdata in files_pdf:
                     with btn_cols[col_idx]:
                         st.download_button(
                             f"📄 {fname}",
@@ -1811,27 +1847,52 @@ def render_loader_page():
                             else:
                                 st.info("Aún no hay actas registradas para descargar.")
                             return
-                        # Mostrar tabla sin columna de descarga
-                        visible_cols = [c for c in df_act.columns if c not in ("file_path", "file_name")]
+                        # Construir columna de descarga con data URLs para la tabla
+                        import base64
+                        download_urls = []
+                        file_cache: list[tuple[str, bytes | None]] = []
+                        for _, r in df_act.iterrows():
+                            fpath = str(r.get("file_path", ""))
+                            safe_name = str(r.get("file_name") or "acta.xlsx").replace(",", "_")
+                            file_data = read_file_bytes(fpath) if fpath else None
+                            file_cache.append((safe_name, file_data))
+                            if file_data:
+                                try:
+                                    b64 = base64.b64encode(file_data).decode()
+                                    url = (
+                                        "data:application/"
+                                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + b64
+                                    )
+                                except Exception:
+                                    url = ""
+                            else:
+                                url = ""
+                            download_urls.append(url)
+                        df_act["Descargar"] = pd.Series(download_urls, dtype=object)
+
+                        visible_cols = [c for c in df_act.columns if c not in ("file_path", "Descargar")] + ["Descargar"]
                         df_view = df_act[[c for c in visible_cols if c in df_act.columns]]
-                        pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns}
+                        pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns if c != "Descargar"}
                         st.data_editor(
                             df_view,
                             width='stretch',
                             hide_index=True,
                             disabled=True,
-                            column_config=pretty_cols,
+                            column_config={
+                                "Descargar": st.column_config.LinkColumn(
+                                    "Descargar",
+                                    display_text="⬇️ Descargar",
+                                ),
+                                **pretty_cols,
+                            },
                         )
 
-                        # Botones de descarga individuales con nombre correcto
-                        import base64
-                        for idx, r in df_act.iterrows():
-                            fpath = str(r.get("file_path", ""))
-                            file_data = read_file_bytes(fpath) if fpath else None
+                        # Botones de descarga con nombre correcto
+                        st.caption("Descarga con nombre correcto:")
+                        for idx, (safe_name, file_data) in enumerate(file_cache):
                             if file_data:
-                                safe_name = str(r.get("file_name") or "acta.xlsx").replace(",", "_")
                                 st.download_button(
-                                    f"⬇️ {safe_name}",
+                                    f"📥 {safe_name}",
                                     data=file_data,
                                     file_name=safe_name,
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2384,6 +2445,188 @@ def render_new_invoices_page():
             st.error(f"Error al cargar historial: {exc}")
 
 
+def render_sabanas_page():
+    st.header("Sábanas de Conciliación")
+
+    cfg, missing = get_db_config()
+    if missing:
+        st.warning("Faltan variables de entorno MySQL.")
+        return
+
+    import pymysql
+
+    # Buscar prestador
+    search_term = st.text_input(
+        "Buscar prestador por NIT o nombre",
+        key="sabana_search",
+        placeholder="Ingresa NIT o nombre del prestador",
+    )
+
+    if not search_term or len(search_term.strip()) < 2:
+        st.info("Ingresa al menos 2 caracteres para buscar un prestador.")
+        return
+
+    try:
+        conn = pymysql.connect(
+            host=cfg["host"], port=cfg["port"], user=cfg["user"],
+            password=cfg["password"], database=cfg["database"],
+            cursorclass=pymysql.cursors.Cursor,
+        )
+    except Exception as exc:
+        st.error(f"Error de conexión: {exc}")
+        return
+
+    try:
+        with conn.cursor() as cur:
+            term = search_term.strip()
+            cur.execute(
+                "SELECT id, name FROM thirds WHERE id = %s OR name LIKE %s LIMIT 20",
+                (term, f"%{term}%"),
+            )
+            providers = cur.fetchall()
+
+        if not providers:
+            st.warning("No se encontraron prestadores.")
+            return
+
+        provider_options = {f"{pid} — {pname}": pid for pid, pname in providers}
+        selected_label = st.selectbox("Selecciona prestador", list(provider_options.keys()), key="sabana_provider")
+        provider_id = provider_options[selected_label]
+
+        SABANA_QUERY = """
+            SELECT
+                aud.id,
+                aud.factura_id,
+                aud.servicio_id,
+                aud.origin,
+                aud.nit,
+                aud.razon_social,
+                aud.numero_factura,
+                aud.fecha_inicio,
+                aud.fecha_fin,
+                aud.modalidad,
+                aud.regimen,
+                aud.cobertura,
+                aud.contrato,
+                aud.tipo_documento,
+                aud.numero_documento,
+                aud.primer_nombre,
+                aud.segundo_nombre,
+                aud.primer_apellido,
+                aud.segundo_apellido,
+                aud.genero,
+                aud.codigo_servicio,
+                aud.descripcion_servicio,
+                aud.cantidad_servicio,
+                aud.valor_unitario_servicio,
+                aud.valor_total_servicio,
+                aud.codigos_glosa,
+                REGEXP_REPLACE(aud.observaciones_glosas, '[\\\\r\\\\n\\\\t]+', ' ') AS observaciones_glosas,
+                aud.valor_glosa,
+                aud.valor_aprobado,
+                ci.response_status AS estado_respuesta,
+                ci.autorization_number AS numero_de_autorizacion,
+                NULL AS respuesta_de_ips,
+                ci.accepted_value_ips AS valor_aceptado_ips,
+                ci.accepted_value_eps AS valor_aceptado_eps,
+                ci.eps_ratified_value AS valor_ratificado_eps,
+                ci.observation AS observaciones
+            FROM auditory_final_reports aud
+            INNER JOIN estados_auditory_final_reports eafr
+                ON eafr.ID = aud.id
+            INNER JOIN invoice_audits ia
+                ON ia.id = aud.factura_id
+            INNER JOIN thirds t
+                ON t.id = ia.third_id
+            LEFT JOIN conciliation_results ci
+                ON ci.auditory_final_report_id = aud.id
+            WHERE t.id = %s
+            AND eafr.ESTADO = 'contabilizada'
+            AND aud.valor_glosa > 0
+        """
+
+        EXCEL_HEADERS = [
+            "ID", "FACTURA_ID", "SERVICIO_ID", "ORIGIN", "NIT", "RAZON_SOCIAL",
+            "NUMERO_FACTURA", "FECHA_INICIO", "FECHA_FIN", "MODALIDAD", "REGIMEN",
+            "COBERTURA", "CONTRATO", "TIPO_DOCUMENTO", "NUMERO_DOCUMENTO",
+            "PRIMER_NOMBRE", "SEGUNDO_NOMBRE", "PRIMER_APELLIDO", "SEGUNDO_APELLIDO",
+            "GENERO", "CODIGO_SERVICIO", "DESCRIPCION_SERVICIO", "CANTIDAD_SERVICIO",
+            "VALOR_UNITARIO_SERVICIO", "VALOR_TOTAL_SERVICIO", "CODIGOS_GLOSA",
+            "OBSERVACIONES_GLOSAS", "VALOR_GLOSA", "VALOR_APROBADO",
+            "ESTADO_RESPUESTA", "NUMERO_DE_AUTORIZACION", "RESPUESTA_DE_IPS",
+            "VALOR_ACEPTADO_POR_IPS", "VALOR_ACEPTADO_POR_EPS",
+            "VALOR_RATIFICADO_EPS", "OBSERVACIONES",
+        ]
+
+        tab_rat, tab_sin = st.tabs(["Ratificados", "Sin conciliación"])
+
+        with tab_rat:
+            with conn.cursor() as cur:
+                cur.execute(SABANA_QUERY + " AND ci.eps_ratified_value > 0", (provider_id,))
+                rows_rat = cur.fetchall()
+            df_rat = pd.DataFrame(rows_rat, columns=EXCEL_HEADERS)
+            st.metric("Registros ratificados", len(df_rat))
+
+            if not df_rat.empty:
+                # Alerta de servicios parcialmente ratificados
+                parcial = df_rat[
+                    (df_rat["VALOR_ACEPTADO_POR_IPS"].fillna(0).astype(float) > 0) |
+                    (df_rat["VALOR_ACEPTADO_POR_EPS"].fillna(0).astype(float) > 0)
+                ]
+                if not parcial.empty:
+                    st.warning(
+                        "El prestador tiene servicios parcialmente ratificados. "
+                        "Algunos registros ratificados también tienen valores aceptados por IPS o EPS."
+                    )
+
+                st.dataframe(df_rat, use_container_width=True, hide_index=True)
+
+                from io import BytesIO
+                buf = BytesIO()
+                df_rat.to_excel(buf, index=False, sheet_name="Ratificados")
+                buf.seek(0)
+                safe_nit = ''.join(ch for ch in str(provider_id) if ch.isalnum())
+                st.download_button(
+                    f"📥 Descargar ratificados ({len(df_rat)} registros)",
+                    data=buf.getvalue(),
+                    file_name=f"sabana_ratificados_{safe_nit}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_sabana_rat",
+                )
+            else:
+                st.info("No hay registros ratificados para este prestador.")
+
+        with tab_sin:
+            with conn.cursor() as cur:
+                cur.execute(SABANA_QUERY + " AND ci.id IS NULL", (provider_id,))
+                rows_sin = cur.fetchall()
+            df_sin = pd.DataFrame(rows_sin, columns=EXCEL_HEADERS)
+            st.metric("Registros sin conciliación", len(df_sin))
+
+            if not df_sin.empty:
+                st.dataframe(df_sin, use_container_width=True, hide_index=True)
+
+                from io import BytesIO
+                buf = BytesIO()
+                df_sin.to_excel(buf, index=False, sheet_name="Sin conciliación")
+                buf.seek(0)
+                safe_nit = ''.join(ch for ch in str(provider_id) if ch.isalnum())
+                st.download_button(
+                    f"📥 Descargar sin conciliación ({len(df_sin)} registros)",
+                    data=buf.getvalue(),
+                    file_name=f"sabana_sin_conciliacion_{safe_nit}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_sabana_sin",
+                )
+            else:
+                st.info("No hay registros sin conciliación para este prestador.")
+
+    except Exception as exc:
+        st.error(f"Error al consultar sábanas: {exc}")
+    finally:
+        conn.close()
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -2392,7 +2635,7 @@ def main():
     ensure_dirs()
 
     default_menu = st.session_state.get("menu_option", "Cargar CSV")
-    menu_options = ["Cargar CSV", "Cargar nuevas facturas", "Resumen", "Reportes", "Dashboard BI", "Mesas de Conciliación"]
+    menu_options = ["Cargar CSV", "Cargar nuevas facturas", "Resumen", "Reportes", "Dashboard BI", "Mesas de Conciliación", "Sábanas de Conciliación"]
 
     show_detail_option = bool(st.session_state.get("selected_nit"))
     if show_detail_option:
@@ -2425,6 +2668,8 @@ def main():
         render_dashboard_page()
     elif menu_option == "Mesas de Conciliación":
         render_mesas_page()
+    elif menu_option == "Sábanas de Conciliación":
+        render_sabanas_page()
     else:
         render_loader_page()
 
