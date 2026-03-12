@@ -620,8 +620,7 @@ def render_summary_page():
     df_view = filtered.copy()
     df_view["Acciones"] = False
 
-    # Agregar columnas de descargas por NIT (Excel/PDF)
-    link_cols: list[str] = []
+    # Cargar archivos de actas por NIT (Excel/PDF) para descarga
     try:
         conn = pymysql.connect(
             host=cfg["host"],
@@ -652,57 +651,34 @@ def render_summary_page():
         finally:
             conn.close()
 
-        excel_map: dict[str, list[str]] = {}
+        excel_map: dict[str, list[tuple[str, bytes]]] = {}
         for nit_val, _fname, fpath, _created in excel_rows:
             try:
                 file_data = read_file_bytes(str(fpath)) if fpath else None
                 if file_data:
-                    b64 = base64.b64encode(file_data).decode()
                     safe_name = str(_fname or "acta.xlsx").replace(",", "_")
-                    url = (
-                        "data:application/"
-                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64,"
-                        + b64
-                    )
-                else:
-                    url = ""
+                    excel_map.setdefault(str(nit_val), []).append((safe_name, file_data))
             except Exception:
-                url = ""
-            excel_map.setdefault(str(nit_val), []).append(url)
+                pass
 
-        pdf_map: dict[str, list[str]] = {}
+        pdf_map: dict[str, list[tuple[str, bytes]]] = {}
         for nit_val, _fname, fpath, _created in pdf_rows:
             try:
                 file_data = read_file_bytes(str(fpath)) if fpath else None
                 if file_data:
-                    b64 = base64.b64encode(file_data).decode()
                     safe_name = str(_fname or "acta.pdf").replace(",", "_")
-                    url = f"data:application/octet-stream;name={safe_name};base64,{b64}"
-                else:
-                    url = ""
+                    pdf_map.setdefault(str(nit_val), []).append((safe_name, file_data))
             except Exception:
-                url = ""
-            pdf_map.setdefault(str(nit_val), []).append(url)
+                pass
 
-        max_excel = max((len(v) for v in excel_map.values()), default=0)
-        max_pdf = max((len(v) for v in pdf_map.values()), default=0)
-
-        for i in range(max_excel):
-            col_name = ("Actas excel" if i == 0 else f"Actas excel {i+1}")
-            link_cols.append(col_name)
-            df_view[col_name] = df_view["nit"].map(lambda n: (excel_map.get(str(n), []) + [""] * max_excel)[i])
-        for i in range(max_pdf):
-            col_name = ("Actas pdf" if i == 0 else f"Actas pdf {i+1}")
-            link_cols.append(col_name)
-            df_view[col_name] = df_view["nit"].map(lambda n: (pdf_map.get(str(n), []) + [""] * max_pdf)[i])
     except Exception:
-        link_cols = []
+        pass
 
     # Configurar etiquetas amigables para columnas base (reemplazar '_' por ' ')
     pretty_labels = {
         col: st.column_config.Column(col.replace("_", " "))
         for col in df_view.columns
-        if col != "Acciones" and col not in link_cols
+        if col != "Acciones"
     }
 
     editor_result = st.data_editor(
@@ -716,19 +692,42 @@ def render_summary_page():
                 help="Agregar estado al NIT",
                 default=False,
             ),
-            **{
-                col: st.column_config.LinkColumn(
-                    col,
-                    display_text=(
-                        "Descargar Acta" if col.lower().startswith("actas excel") else "Acta firmada"
-                    ),
-                )
-                for col in link_cols
-            },
             **pretty_labels,
         },
         key="summary_table_editor",
     )
+
+    # Botones de descarga de actas por NIT con nombre correcto
+    if excel_map or pdf_map:
+        with st.expander("Descargar actas por NIT", expanded=False):
+            for nit_val in df_view["nit"].astype(str).unique():
+                files_excel = excel_map.get(nit_val, [])
+                files_pdf = pdf_map.get(nit_val, [])
+                if not files_excel and not files_pdf:
+                    continue
+                st.caption(f"NIT: {nit_val}")
+                btn_cols = st.columns(len(files_excel) + len(files_pdf))
+                col_idx = 0
+                for fname, fdata in files_excel:
+                    with btn_cols[col_idx]:
+                        st.download_button(
+                            f"📊 {fname}",
+                            data=fdata,
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"dl_resumen_xl_{nit_val}_{col_idx}",
+                        )
+                    col_idx += 1
+                for fname, fdata in files_pdf:
+                    with btn_cols[col_idx]:
+                        st.download_button(
+                            f"📄 {fname}",
+                            data=fdata,
+                            file_name=fname,
+                            mime="application/pdf",
+                            key=f"dl_resumen_pdf_{nit_val}_{col_idx}",
+                        )
+                    col_idx += 1
 
     st.download_button(
         "Descargar CSV",
@@ -1812,47 +1811,32 @@ def render_loader_page():
                             else:
                                 st.info("Aún no hay actas registradas para descargar.")
                             return
-                        # Construir columna de descarga dentro de la tabla usando data URLs
-                        import base64
-                        download_urls = []
-                        for _, r in df_act.iterrows():
-                            fpath = str(r.get("file_path", ""))
-                            file_data = read_file_bytes(fpath) if fpath else None
-                            if file_data:
-                                try:
-                                    b64 = base64.b64encode(file_data).decode()
-                                    safe_name = str(r.get("file_name") or "acta.xlsx").replace(",", "_")
-                                    url = (
-                                        "data:application/"
-                                        f"vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64," + b64
-                                    )
-                                except Exception:
-                                    url = ""
-                            else:
-                                url = ""
-                            download_urls.append(url)
-                        # Forzar tipo texto para compatibilidad con LinkColumn
-                        df_act["Descargar"] = pd.Series(download_urls, dtype=object)
-
-                        # Mostrar como editor solo-lectura con columna Link
-                        # Evitar duplicar "Descargar" y ocultar "file_path"
-                        visible_cols = [c for c in df_act.columns if c not in ("file_path", "Descargar")] + ["Descargar"]
+                        # Mostrar tabla sin columna de descarga
+                        visible_cols = [c for c in df_act.columns if c not in ("file_path", "file_name")]
                         df_view = df_act[[c for c in visible_cols if c in df_act.columns]]
-                        # Etiquetas amigables: reemplazar '_' por ' '
-                        pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns if c != "Descargar"}
+                        pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns}
                         st.data_editor(
                             df_view,
                             width='stretch',
                             hide_index=True,
                             disabled=True,
-                            column_config={
-                                "Descargar": st.column_config.LinkColumn(
-                                    "Descargar",
-                                    display_text="⬇️ Descargar",
-                                ),
-                                **pretty_cols,
-                            },
+                            column_config=pretty_cols,
                         )
+
+                        # Botones de descarga individuales con nombre correcto
+                        import base64
+                        for idx, r in df_act.iterrows():
+                            fpath = str(r.get("file_path", ""))
+                            file_data = read_file_bytes(fpath) if fpath else None
+                            if file_data:
+                                safe_name = str(r.get("file_name") or "acta.xlsx").replace(",", "_")
+                                st.download_button(
+                                    f"⬇️ {safe_name}",
+                                    data=file_data,
+                                    file_name=safe_name,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"dl_acta_{idx}",
+                                )
                 finally:
                     conn.close()
         except Exception as ex:
@@ -2372,39 +2356,28 @@ def render_new_invoices_page():
                         if df_hist.empty:
                             st.info("No se encontraron importaciones." + (" Para el NIT ingresado." if nit_hist else ""))
                         else:
-                            # Preparar columna de descarga
-                            download_urls = []
-                            for _, r in df_hist.iterrows():
-                                fpath = str(r.get("file_path", ""))
-                                file_data = read_file_bytes(fpath) if fpath else None
-                                if file_data:
-                                    try:
-                                        b64 = base64.b64encode(file_data).decode()
-                                        safe_name = str(r.get("file_name") or "sabana.xlsx").replace(",", "_")
-                                        url = f"data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;name={safe_name};base64,{b64}"
-                                    except Exception:
-                                        url = ""
-                                else:
-                                    url = ""
-                                download_urls.append(url)
-
-                            df_hist["Descargar"] = pd.Series(download_urls, dtype=object)
-                            visible_cols = [c for c in df_hist.columns if c not in ("file_path", "file_name", "Descargar")] + ["Descargar"]
+                            visible_cols = [c for c in df_hist.columns if c not in ("file_path", "file_name")]
                             df_view = df_hist[[c for c in visible_cols if c in df_hist.columns]]
-                            pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns if c != "Descargar"}
+                            pretty_cols = {c: st.column_config.Column(c.replace("_", " ")) for c in df_view.columns}
                             st.data_editor(
                                 df_view,
                                 width='stretch',
                                 hide_index=True,
                                 disabled=True,
-                                column_config={
-                                    "Descargar": st.column_config.LinkColumn(
-                                        "Descargar",
-                                        display_text="Descargar sábana",
-                                    ),
-                                    **pretty_cols,
-                                },
+                                column_config=pretty_cols,
                             )
+                            for idx, r in df_hist.iterrows():
+                                fpath = str(r.get("file_path", ""))
+                                file_data = read_file_bytes(fpath) if fpath else None
+                                if file_data:
+                                    safe_name = str(r.get("file_name") or "sabana.xlsx").replace(",", "_")
+                                    st.download_button(
+                                        f"⬇️ {safe_name}",
+                                        data=file_data,
+                                        file_name=safe_name,
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"dl_sabana_{idx}",
+                                    )
             finally:
                 conn.close()
         except Exception as exc:
